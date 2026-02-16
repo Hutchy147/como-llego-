@@ -442,80 +442,6 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     });
   }
 
-  String _startSelectionLabel() {
-    if (_startCheckpointNumber == null) return 'Inicio: Mi ubicación (default)';
-    return 'Inicio: Checkpoint $_startCheckpointNumber';
-  }
-
-  String _endSelectionLabel() {
-    if (_endCheckpointNumber == null) return 'Final: Último checkpoint (default)';
-    return 'Final: Checkpoint $_endCheckpointNumber';
-  }
-
-  Future<void> _openRouteConfigSheet() async {
-    await showModalBottomSheet<void>(
-      context: context,
-      showDragHandle: true,
-      builder: (sheetContext) {
-        return StatefulBuilder(
-          builder: (context, setModalState) {
-            return SafeArea(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'Configurar ruta',
-                      style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
-                    ),
-                    const SizedBox(height: 16),
-                    ListTile(
-                      contentPadding: EdgeInsets.zero,
-                      leading: const Icon(Icons.flag_circle_outlined),
-                      title: Text(_startSelectionLabel()),
-                      trailing: TextButton(
-                        onPressed: () async {
-                          await _pickStartCheckpoint();
-                          if (!mounted) return;
-                          setModalState(() {});
-                        },
-                        child: const Text('Cambiar inicio'),
-                      ),
-                    ),
-                    const Divider(height: 10),
-                    ListTile(
-                      contentPadding: EdgeInsets.zero,
-                      leading: const Icon(Icons.outlined_flag),
-                      title: Text(_endSelectionLabel()),
-                      trailing: TextButton(
-                        onPressed: () async {
-                          await _pickEndCheckpoint();
-                          if (!mounted) return;
-                          setModalState(() {});
-                        },
-                        child: const Text('Cambiar final'),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    SizedBox(
-                      width: double.infinity,
-                      child: FilledButton(
-                        onPressed: () => Navigator.pop(sheetContext),
-                        child: const Text('Listo'),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            );
-          },
-        );
-      },
-    );
-  }
-
   // ---------------------------
   // ROUTING (OSRM)
   // ---------------------------
@@ -912,6 +838,125 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     );
   }
 
+  Widget _buildBottomUi() {
+    return Positioned(
+      left: 12,
+      right: 12,
+      bottom: 12,
+      child: SafeArea(
+        top: false,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (!_navMode && _checkpoints.isNotEmpty)
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.95),
+                  borderRadius: BorderRadius.circular(16),
+                  boxShadow: [
+                    BoxShadow(
+                      blurRadius: 12,
+                      offset: const Offset(0, 6),
+                      color: Colors.black.withOpacity(0.06),
+                    )
+                  ],
+                ),
+                child: Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    for (int i = 0; i < _checkpoints.length; i++)
+                      Chip(
+                        label: Text('P${i + 1}'),
+                        onDeleted: () => _removeCheckpoint(i),
+                      ),
+                    TextButton.icon(
+                      onPressed: _clearAll,
+                      icon: const Icon(Icons.delete_outline),
+                      label: const Text('Borrar'),
+                    ),
+                  ],
+                ),
+              ),
+            if (!_navMode && _checkpoints.isNotEmpty) const SizedBox(height: 10),
+            if (!_navMode)
+              Row(
+                children: [
+                  Expanded(
+                    child: FilledButton.icon(
+                      onPressed: _pickStartCheckpoint,
+                      icon: const Icon(Icons.flag_circle_outlined),
+                      label: const Text('Inicio'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: FilledButton.icon(
+                      onPressed: _pickEndCheckpoint,
+                      icon: const Icon(Icons.outlined_flag),
+                      label: const Text('Final'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: FilledButton.icon(
+                      onPressed: _buildingRoute ? null : _buildRoute,
+                      icon: _buildingRoute
+                          ? const SizedBox(
+                              width: 14,
+                              height: 14,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.play_arrow_rounded),
+                      label: const Text('Iniciar'),
+                    ),
+                  ),
+                ],
+              ),
+            if (!_navMode) const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: _centerOnMe,
+                    icon: const Icon(Icons.my_location),
+                    label: const Text('Centrar'),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: FilledButton.tonalIcon(
+                    onPressed: _arrivedManual,
+                    icon: const Icon(Icons.check),
+                    label: const Text('Llegué'),
+                  ),
+                ),
+                if (_navMode) ...[
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: FilledButton.icon(
+                      onPressed: _buildingRoute ? null : _buildRoute,
+                      icon: _buildingRoute
+                          ? const SizedBox(
+                              width: 14,
+                              height: 14,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.refresh),
+                      label: const Text('Recalcular'),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final distText = _metersToNext == null ? null : _formatMeters(_metersToNext!);
@@ -972,122 +1017,7 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
 
             if (!_navMode) ..._buildNormalTopUi(distText),
             if (_navMode) _buildNavTopUi(distText),
-
-            // Chips checkpoints
-            if (!_navMode)
-              Positioned(
-                left: 12,
-                right: 12,
-                bottom: 110,
-                child: _checkpoints.isEmpty
-                    ? const SizedBox.shrink()
-                    : Container(
-                        padding: const EdgeInsets.all(10),
-                        decoration: BoxDecoration(
-                          color: Colors.white.withOpacity(0.95),
-                          borderRadius: BorderRadius.circular(16),
-                          boxShadow: [
-                            BoxShadow(
-                              blurRadius: 12,
-                              offset: const Offset(0, 6),
-                              color: Colors.black.withOpacity(0.06),
-                            )
-                          ],
-                        ),
-                        child: Wrap(
-                          spacing: 8,
-                          runSpacing: 8,
-                          children: [
-                            for (int i = 0; i < _checkpoints.length; i++)
-                              Chip(
-                                label: Text('P${i + 1}'),
-                                onDeleted: () => _removeCheckpoint(i),
-                              ),
-                            if (_checkpoints.isNotEmpty)
-                              TextButton.icon(
-                                onPressed: _clearAll,
-                                icon: const Icon(Icons.delete_outline),
-                                label: const Text('Borrar'),
-                              ),
-                          ],
-                        ),
-                      ),
-              ),
-
-            // Configuración inicio/final
-            if (!_navMode)
-              Positioned(
-                left: 18,
-                bottom: 90,
-                child: SizedBox(
-                  width: 56,
-                  height: 56,
-                  child: FloatingActionButton(
-                    heroTag: 'route_config',
-                    tooltip: 'Configurar ruta',
-                    onPressed: _openRouteConfigSheet,
-                    child: const Icon(Icons.alt_route),
-                  ),
-                ),
-              ),
-            // Botón centrar en mi ubicación
-            Positioned(
-              left: 18,
-              bottom: 22,
-              child: SizedBox(
-                width: 56,
-                height: 56,
-                child: FloatingActionButton(
-                  heroTag: 'center_me',
-                  onPressed: _centerOnMe,
-                  child: const Icon(Icons.my_location),
-                ),
-              ),
-            ),
-
-            // Botón “llegué” (manual)
-            Positioned(
-              left: 84,
-              bottom: 22,
-              child: SizedBox(
-                width: _navMode ? 62 : 56,
-                height: _navMode ? 62 : 56,
-                child: FloatingActionButton(
-                  heroTag: 'arrived',
-                  onPressed: _arrivedManual,
-                  child: const Icon(Icons.check),
-                ),
-              ),
-            ),
-
-            if (!_navMode)
-              Positioned(
-                right: 18,
-                bottom: 22,
-                child: SizedBox(
-                  width: 62,
-                  height: 62,
-                  child: FloatingActionButton(
-                    heroTag: 'start_route',
-                    onPressed: _buildingRoute ? null : _buildRoute,
-                    child: const Icon(Icons.play_arrow_rounded, size: 34),
-                  ),
-                ),
-              ),
-            if (_navMode)
-              Positioned(
-                right: 18,
-                bottom: 22,
-                child: SizedBox(
-                  width: 62,
-                  height: 62,
-                  child: FloatingActionButton(
-                    heroTag: 'recalc_route',
-                    onPressed: _buildingRoute ? null : _buildRoute,
-                    child: const Icon(Icons.refresh, size: 30),
-                  ),
-                ),
-              ),
+            _buildBottomUi(),
           ],
         ),
       ),
