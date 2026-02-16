@@ -61,6 +61,7 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
   // UI estado
   bool _buildingRoute = false;
   bool _trackingRoute = false;
+  bool _navMode = false;
   double? _metersToNext; // distancia al próximo checkpoint
   bool _offRoute = false;
 
@@ -441,10 +442,86 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     });
   }
 
+  String _startSelectionLabel() {
+    if (_startCheckpointNumber == null) return 'Inicio: Mi ubicación (default)';
+    return 'Inicio: Checkpoint $_startCheckpointNumber';
+  }
+
+  String _endSelectionLabel() {
+    if (_endCheckpointNumber == null) return 'Final: Último checkpoint (default)';
+    return 'Final: Checkpoint $_endCheckpointNumber';
+  }
+
+  Future<void> _openRouteConfigSheet() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) {
+        return StatefulBuilder(
+          builder: (context, setModalState) {
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Configurar ruta',
+                      style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
+                    ),
+                    const SizedBox(height: 16),
+                    ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: const Icon(Icons.flag_circle_outlined),
+                      title: Text(_startSelectionLabel()),
+                      trailing: TextButton(
+                        onPressed: () async {
+                          await _pickStartCheckpoint();
+                          if (!mounted) return;
+                          setModalState(() {});
+                        },
+                        child: const Text('Cambiar inicio'),
+                      ),
+                    ),
+                    const Divider(height: 10),
+                    ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: const Icon(Icons.outlined_flag),
+                      title: Text(_endSelectionLabel()),
+                      trailing: TextButton(
+                        onPressed: () async {
+                          await _pickEndCheckpoint();
+                          if (!mounted) return;
+                          setModalState(() {});
+                        },
+                        child: const Text('Cambiar final'),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    SizedBox(
+                      width: double.infinity,
+                      child: FilledButton(
+                        onPressed: () => Navigator.pop(sheetContext),
+                        child: const Text('Listo'),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
   // ---------------------------
   // ROUTING (OSRM)
   // ---------------------------
   Future<void> _buildRoute() async {
+    if (_buildingRoute) return;
+
     if (_checkpoints.length < 2) {
       _snack('Agregá al menos 2 checkpoints.');
       return;
@@ -493,9 +570,11 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
       final coordsList = data['routes'][0]['geometry']['coordinates'] as List<dynamic>;
       final line = coordsList.map((c) => LatLng(c[1].toDouble(), c[0].toDouble())).toList();
 
+      if (!mounted) return;
       setState(() {
         _routeLine = line;
         _trackingRoute = true;
+        _navMode = true;
       });
 
       _updateDistanceToNext();
@@ -668,6 +747,171 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     return '${(meters / 1000).toStringAsFixed(2)} km';
   }
 
+  void _exitNavMode() {
+    setState(() => _navMode = false);
+  }
+
+  List<Widget> _buildNormalTopUi(String? distText) {
+    return [
+      Positioned(
+        top: 12,
+        left: 12,
+        right: 12,
+        child: Row(
+          children: [
+            Builder(
+              builder: (context) => _IconPill(
+                icon: Icons.menu,
+                onTap: () => Scaffold.of(context).openDrawer(),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: InkWell(
+                onTap: _openSearchSheet,
+                borderRadius: BorderRadius.circular(16),
+                child: Container(
+                  height: 46,
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.95),
+                    borderRadius: BorderRadius.circular(16),
+                    boxShadow: [
+                      BoxShadow(
+                        blurRadius: 12,
+                        offset: const Offset(0, 6),
+                        color: Colors.black.withOpacity(0.06),
+                      )
+                    ],
+                  ),
+                  child: const Row(
+                    children: [
+                      SizedBox(width: 12),
+                      Icon(Icons.search, color: Color(0xFF6B7280)),
+                      SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          'Buscar ubicación...',
+                          style: TextStyle(color: Color(0xFF6B7280)),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+      Positioned(
+        top: 70,
+        left: 12,
+        right: 12,
+        child: (distText == null)
+            ? const SizedBox.shrink()
+            : Row(
+                children: [
+                  Expanded(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withOpacity(0.95),
+                        borderRadius: BorderRadius.circular(16),
+                        boxShadow: [
+                          BoxShadow(
+                            blurRadius: 12,
+                            offset: const Offset(0, 6),
+                            color: Colors.black.withOpacity(0.06),
+                          )
+                        ],
+                      ),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.flag_outlined, size: 18),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              'Próximo: $distText${_offRoute ? "  •  fuera de ruta" : ""}',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(fontWeight: FontWeight.w600),
+                            ),
+                          ),
+                          if (_buildingRoute)
+                            const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+      ),
+    ];
+  }
+
+  Widget _buildNavTopUi(String? distText) {
+    final nextText = distText ?? '--';
+    return Positioned(
+      top: 12,
+      left: 12,
+      right: 12,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        decoration: BoxDecoration(
+          color: Colors.white.withOpacity(0.95),
+          borderRadius: BorderRadius.circular(18),
+          boxShadow: [
+            BoxShadow(
+              blurRadius: 12,
+              offset: const Offset(0, 6),
+              color: Colors.black.withOpacity(0.06),
+            )
+          ],
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: Text(
+                'Próximo: $nextText${_offRoute ? " • fuera de ruta" : ""}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+            if (_buildingRoute)
+              const Padding(
+                padding: EdgeInsets.only(right: 8),
+                child: SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+              ),
+            SizedBox(
+              width: 32,
+              height: 32,
+              child: IconButton(
+                onPressed: _exitNavMode,
+                style: IconButton.styleFrom(
+                  padding: EdgeInsets.zero,
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                icon: const Icon(Icons.close, size: 18),
+                tooltip: 'Salir navegación',
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final distText = _metersToNext == null ? null : _formatMeters(_metersToNext!);
@@ -726,26 +970,19 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
               ),
             ),
 
-            // Top bar (menú + búsqueda)
-            Positioned(
-              top: 12,
-              left: 12,
-              right: 12,
-              child: Row(
-                children: [
-                  Builder(
-                    builder: (context) => _IconPill(
-                      icon: Icons.menu,
-                      onTap: () => Scaffold.of(context).openDrawer(),
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: InkWell(
-                      onTap: _openSearchSheet,
-                      borderRadius: BorderRadius.circular(16),
-                      child: Container(
-                        height: 46,
+            if (!_navMode) ..._buildNormalTopUi(distText),
+            if (_navMode) _buildNavTopUi(distText),
+
+            // Chips checkpoints
+            if (!_navMode)
+              Positioned(
+                left: 12,
+                right: 12,
+                bottom: 110,
+                child: _checkpoints.isEmpty
+                    ? const SizedBox.shrink()
+                    : Container(
+                        padding: const EdgeInsets.all(10),
                         decoration: BoxDecoration(
                           color: Colors.white.withOpacity(0.95),
                           borderRadius: BorderRadius.circular(16),
@@ -757,143 +994,42 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
                             )
                           ],
                         ),
-                        child: const Row(
+                        child: Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
                           children: [
-                            SizedBox(width: 12),
-                            Icon(Icons.search, color: Color(0xFF6B7280)),
-                            SizedBox(width: 10),
-                            Expanded(
-                              child: Text(
-                                'Buscar ubicación...',
-                                style: TextStyle(color: Color(0xFF6B7280)),
+                            for (int i = 0; i < _checkpoints.length; i++)
+                              Chip(
+                                label: Text('P${i + 1}'),
+                                onDeleted: () => _removeCheckpoint(i),
                               ),
-                            ),
+                            if (_checkpoints.isNotEmpty)
+                              TextButton.icon(
+                                onPressed: _clearAll,
+                                icon: const Icon(Icons.delete_outline),
+                                label: const Text('Borrar'),
+                              ),
                           ],
                         ),
                       ),
-                    ),
+              ),
+
+            // Configuración inicio/final
+            if (!_navMode)
+              Positioned(
+                left: 18,
+                bottom: 90,
+                child: SizedBox(
+                  width: 56,
+                  height: 56,
+                  child: FloatingActionButton(
+                    heroTag: 'route_config',
+                    tooltip: 'Configurar ruta',
+                    onPressed: _openRouteConfigSheet,
+                    child: const Icon(Icons.alt_route),
                   ),
-                ],
-              ),
-            ),
-
-            // Info pill: distancia al próximo + off-route
-            Positioned(
-              top: 70,
-              left: 12,
-              right: 12,
-              child: (distText == null)
-                  ? const SizedBox.shrink()
-                  : Row(
-                      children: [
-                        Expanded(
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                            decoration: BoxDecoration(
-                              color: Colors.white.withOpacity(0.95),
-                              borderRadius: BorderRadius.circular(16),
-                              boxShadow: [
-                                BoxShadow(
-                                  blurRadius: 12,
-                                  offset: const Offset(0, 6),
-                                  color: Colors.black.withOpacity(0.06),
-                                )
-                              ],
-                            ),
-                            child: Row(
-                              children: [
-                                const Icon(Icons.flag_outlined, size: 18),
-                                const SizedBox(width: 8),
-                                Expanded(
-                                  child: Text(
-                                    'Próximo: $distText${_offRoute ? "  •  fuera de ruta" : ""}',
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: const TextStyle(fontWeight: FontWeight.w600),
-                                  ),
-                                ),
-                                if (_buildingRoute)
-                                  const SizedBox(
-                                    width: 18,
-                                    height: 18,
-                                    child: CircularProgressIndicator(strokeWidth: 2),
-                                  ),
-                              ],
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-            ),
-
-            // Chips checkpoints
-            Positioned(
-              left: 12,
-              right: 12,
-              bottom: 110,
-              child: _checkpoints.isEmpty
-                  ? const SizedBox.shrink()
-                  : Container(
-                      padding: const EdgeInsets.all(10),
-                      decoration: BoxDecoration(
-                        color: Colors.white.withOpacity(0.95),
-                        borderRadius: BorderRadius.circular(16),
-                        boxShadow: [
-                          BoxShadow(
-                            blurRadius: 12,
-                            offset: const Offset(0, 6),
-                            color: Colors.black.withOpacity(0.06),
-                          )
-                        ],
-                      ),
-                      child: Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: [
-                          for (int i = 0; i < _checkpoints.length; i++)
-                            Chip(
-                              label: Text('P${i + 1}'),
-                              onDeleted: () => _removeCheckpoint(i),
-                            ),
-                          if (_checkpoints.isNotEmpty)
-                            TextButton.icon(
-                              onPressed: _clearAll,
-                              icon: const Icon(Icons.delete_outline),
-                              label: const Text('Borrar'),
-                            ),
-                        ],
-                      ),
-                    ),
-            ),
-
-            // ---- NUEVOS BOTONES: inicio / final (en la posición de tu imagen) ----
-            Positioned(
-              left: 18,
-              bottom: 90,
-              child: SizedBox(
-                width: 56,
-                height: 56,
-                child: FloatingActionButton(
-                  heroTag: 'pick_start_checkpoint',
-                  onPressed: _pickStartCheckpoint,
-                  child: const Icon(Icons.first_page),
                 ),
               ),
-            ),
-            Positioned(
-              left: 84,
-              bottom: 90,
-              child: SizedBox(
-                width: 56,
-                height: 56,
-                child: FloatingActionButton(
-                  heroTag: 'pick_end_checkpoint',
-                  onPressed: _pickEndCheckpoint,
-                  child: const Icon(Icons.last_page),
-                ),
-              ),
-            ),
-
             // Botón centrar en mi ubicación
             Positioned(
               left: 18,
@@ -914,8 +1050,8 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
               left: 84,
               bottom: 22,
               child: SizedBox(
-                width: 56,
-                height: 56,
+                width: _navMode ? 62 : 56,
+                height: _navMode ? 62 : 56,
                 child: FloatingActionButton(
                   heroTag: 'arrived',
                   onPressed: _arrivedManual,
@@ -924,20 +1060,34 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
               ),
             ),
 
-            // Start / construir ruta (desde MI ubicación)
-            Positioned(
-              right: 18,
-              bottom: 22,
-              child: SizedBox(
-                width: 62,
-                height: 62,
-                child: FloatingActionButton(
-                  heroTag: 'start_route',
-                  onPressed: _buildRoute,
-                  child: const Icon(Icons.play_arrow_rounded, size: 34),
+            if (!_navMode)
+              Positioned(
+                right: 18,
+                bottom: 22,
+                child: SizedBox(
+                  width: 62,
+                  height: 62,
+                  child: FloatingActionButton(
+                    heroTag: 'start_route',
+                    onPressed: _buildingRoute ? null : _buildRoute,
+                    child: const Icon(Icons.play_arrow_rounded, size: 34),
+                  ),
                 ),
               ),
-            ),
+            if (_navMode)
+              Positioned(
+                right: 18,
+                bottom: 22,
+                child: SizedBox(
+                  width: 62,
+                  height: 62,
+                  child: FloatingActionButton(
+                    heroTag: 'recalc_route',
+                    onPressed: _buildingRoute ? null : _buildRoute,
+                    child: const Icon(Icons.refresh, size: 30),
+                  ),
+                ),
+              ),
           ],
         ),
       ),
@@ -1378,3 +1528,5 @@ class _AppDrawer extends StatelessWidget {
     );
   }
 }
+
+
