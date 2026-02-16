@@ -64,6 +64,8 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
   bool _navMode = false;
   double? _metersToNext; // distancia al próximo checkpoint
   bool _offRoute = false;
+  bool _showArrivePrompt = false;
+  DateTime _arrivePromptSnoozeUntil = DateTime.fromMillisecondsSinceEpoch(0);
 
   // Ubicaciones guardadas (persistidas)
   final List<_SavedLocation> _savedLocations = [];
@@ -74,7 +76,7 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
   int? _endCheckpointNumber; // ej: 2
 
   // Config “navegación”
-  static const double _arriveThresholdMeters = 25; // “llegué al punto”
+  static const double _manualArriveUiThresholdMeters = 15;
   static const double _offRouteThresholdMeters = 60; // me desvié (reroute)
   static const double _trimSnapThresholdMeters = 35; // para recortar polyline
   static const int _minSecondsBetweenReroutes = 6;
@@ -275,6 +277,7 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
       _trackingRoute = false;
       _offRoute = false;
       _metersToNext = null;
+      _showArrivePrompt = false;
 
       // si había start/end seteados, los dejamos, pero si quedaron fuera de rango, se limpian
       _sanitizeStartEnd();
@@ -291,6 +294,7 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
       _trackingRoute = false;
       _offRoute = false;
       _metersToNext = null;
+      _showArrivePrompt = false;
 
       _sanitizeStartEnd();
     });
@@ -306,6 +310,8 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
       _trackingRoute = false;
       _offRoute = false;
       _metersToNext = null;
+      _showArrivePrompt = false;
+      _arrivePromptSnoozeUntil = DateTime.fromMillisecondsSinceEpoch(0);
 
       _startCheckpointNumber = null;
       _endCheckpointNumber = null;
@@ -324,6 +330,7 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
       _trackingRoute = false;
       _offRoute = false;
       _metersToNext = null;
+      _showArrivePrompt = false;
 
       _sanitizeStartEnd();
     });
@@ -334,6 +341,21 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     } else {
       _updateDistanceToNext();
     }
+  }
+
+  void _confirmArrived() {
+    setState(() {
+      _showArrivePrompt = false;
+      _arrivePromptSnoozeUntil = DateTime.fromMillisecondsSinceEpoch(0);
+    });
+    _arrivedManual();
+  }
+
+  void _snoozeArrivePrompt() {
+    setState(() {
+      _showArrivePrompt = false;
+      _arrivePromptSnoozeUntil = DateTime.now().add(const Duration(seconds: 30));
+    });
   }
 
   void _removeCheckpointByPoint(LatLng target) {
@@ -357,6 +379,7 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
       _checkpoints.removeAt(0);
     }
     _navQueue = List<LatLng>.from(_checkpoints);
+    if (_checkpoints.isEmpty) _showArrivePrompt = false;
   }
 
   void _sanitizeStartEnd() {
@@ -364,6 +387,7 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     if (n == 0) {
       _startCheckpointNumber = null;
       _endCheckpointNumber = null;
+      _showArrivePrompt = false;
       return;
     }
     if (_startCheckpointNumber != null &&
@@ -462,6 +486,7 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     setState(() {
       _buildingRoute = true;
       _offRoute = false;
+      _showArrivePrompt = false;
     });
 
     try {
@@ -501,6 +526,7 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
         _routeLine = line;
         _trackingRoute = true;
         _navMode = true;
+        _showArrivePrompt = false;
       });
 
       _updateDistanceToNext();
@@ -569,41 +595,37 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
   // ---------------------------
   void _updateDistanceToNext() {
     if (_myPos == null) {
-      setState(() => _metersToNext = null);
+      setState(() {
+        _metersToNext = null;
+        _showArrivePrompt = false;
+      });
       return;
     }
 
     // si hay ruta activa usamos _navQueue, si no, usamos _checkpoints
     final next = _navQueue.isNotEmpty ? _navQueue.first : (_checkpoints.isNotEmpty ? _checkpoints.first : null);
     if (next == null) {
-      setState(() => _metersToNext = null);
+      setState(() {
+        _metersToNext = null;
+        _showArrivePrompt = false;
+      });
       return;
     }
 
     final d = _distance(_myPos!, next).toDouble();
-    setState(() => _metersToNext = d);
+    final now = DateTime.now();
+    final canPrompt = _navMode && _trackingRoute;
+    final inPromptRange = d <= _manualArriveUiThresholdMeters;
+    final snoozeExpired = !now.isBefore(_arrivePromptSnoozeUntil);
 
-    // Auto “llegué”
-    if (_trackingRoute && d <= _arriveThresholdMeters) {
-      // eliminamos el punto alcanzado de navQueue y también de checkpoints
-      final reached = next;
-      if (_navQueue.isNotEmpty) _navQueue.removeAt(0);
-      _removeCheckpointByPoint(reached);
-
-      setState(() {
-        _routeLine = [];
-        _trackingRoute = false;
-        _offRoute = false;
-        _metersToNext = null;
-        _sanitizeStartEnd();
-      });
-
-      if (_checkpoints.length >= 2) {
-        _buildRoute();
-      } else {
-        _updateDistanceToNext();
+    setState(() {
+      _metersToNext = d;
+      if (!canPrompt || !inPromptRange) {
+        _showArrivePrompt = false;
+      } else if (snoozeExpired) {
+        _showArrivePrompt = true;
       }
-    }
+    });
   }
 
   void _trimRouteByProgress() {
@@ -674,7 +696,77 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
   }
 
   void _exitNavMode() {
-    setState(() => _navMode = false);
+    setState(() {
+      _navMode = false;
+      _showArrivePrompt = false;
+    });
+  }
+
+  LatLng? _nextCheckpointForUi() {
+    if (_navQueue.isNotEmpty) return _navQueue.first;
+    if (_checkpoints.isNotEmpty) return _checkpoints.first;
+    return null;
+  }
+
+  String _arrivePromptText() {
+    final next = _nextCheckpointForUi();
+    if (next == null) return '¿Llegaste al próximo checkpoint?';
+
+    int idx = -1;
+    for (int i = 0; i < _checkpoints.length; i++) {
+      final d = _distance(_checkpoints[i], next).toDouble();
+      if (d < 3) {
+        idx = i + 1;
+        break;
+      }
+    }
+
+    if (idx > 0) return '¿Llegaste al checkpoint $idx?';
+    return '¿Llegaste al próximo checkpoint?';
+  }
+
+  Widget _buildArrivePromptOverlay() {
+    return Positioned(
+      left: 16,
+      right: 16,
+      bottom: 98,
+      child: Material(
+        color: Colors.white.withOpacity(0.97),
+        borderRadius: BorderRadius.circular(16),
+        elevation: 4,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                _arrivePromptText(),
+                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextButton(
+                      onPressed: _snoozeArrivePrompt,
+                      child: const Text('Todavía no'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: FilledButton(
+                      onPressed: _confirmArrived,
+                      child: const Text('Llegué'),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   List<Widget> _buildNormalTopUi(String? distText) {
@@ -925,14 +1017,6 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
                     label: const Text('Centrar'),
                   ),
                 ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: FilledButton.tonalIcon(
-                    onPressed: _arrivedManual,
-                    icon: const Icon(Icons.check),
-                    label: const Text('Llegué'),
-                  ),
-                ),
                 if (_navMode) ...[
                   const SizedBox(width: 8),
                   Expanded(
@@ -1018,6 +1102,7 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
             if (!_navMode) ..._buildNormalTopUi(distText),
             if (_navMode) _buildNavTopUi(distText),
             _buildBottomUi(),
+            if (_showArrivePrompt && _navMode && _nextCheckpointForUi() != null) _buildArrivePromptOverlay(),
           ],
         ),
       ),
