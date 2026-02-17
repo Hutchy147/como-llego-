@@ -39,10 +39,19 @@ class MapHomeScreen extends StatefulWidget {
 class _MapHomeScreenState extends State<MapHomeScreen> {
   final MapController _mapController = MapController();
   final Distance _distance = const Distance();
+  final ValueNotifier<double?> _metersToNextNotifier = ValueNotifier<double?>(
+    null,
+  );
+  final ValueNotifier<bool> _offRouteNotifier = ValueNotifier<bool>(false);
+  final ValueNotifier<bool> _showArrivePromptNotifier = ValueNotifier<bool>(
+    false,
+  );
+  final ValueNotifier<bool> _buildingRouteNotifier = ValueNotifier<bool>(false);
+  final ValueNotifier<bool> _navModeNotifier = ValueNotifier<bool>(false);
 
   // Centro por defecto (Mendoza)
-  LatLng _center = const LatLng(-32.8895, -68.8458);
-  double _zoom = 15;
+  final LatLng _center = const LatLng(-32.8895, -68.8458);
+  final double _zoom = 15;
 
   // Checkpoints marcados (orden “visual”/lista)
   final List<LatLng> _checkpoints = [];
@@ -87,8 +96,18 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
   static const double _offRouteThresholdMeters = 60; // me desvié (reroute)
   static const double _trimSnapThresholdMeters = 35; // para recortar polyline
   static const int _minSecondsBetweenReroutes = 6;
+  static const Duration _distanceUiMinInterval = Duration(milliseconds: 400);
+  static const Duration _trimMinInterval = Duration(milliseconds: 500);
+  static const Duration _offRouteCheckMinInterval = Duration(milliseconds: 700);
+  static const double _distanceUiMinDeltaMeters = 3.0;
 
   DateTime _lastReroute = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastDistanceUiUpdate = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastTrimAt = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastOffRouteCheckAt = DateTime.fromMillisecondsSinceEpoch(0);
+  int _lastTrimBestIdx = 0;
+  int _lastOffRouteBestIdx = 0;
+  bool _rerouteInFlight = false;
 
   @override
   void initState() {
@@ -101,6 +120,11 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
   @override
   void dispose() {
     _posSub?.cancel();
+    _metersToNextNotifier.dispose();
+    _offRouteNotifier.dispose();
+    _showArrivePromptNotifier.dispose();
+    _buildingRouteNotifier.dispose();
+    _navModeNotifier.dispose();
     super.dispose();
   }
 
@@ -194,7 +218,6 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
         desiredAccuracy: LocationAccuracy.bestForNavigation,
       );
       _setMyPos(p);
-      if (mounted) setState(() {});
       if (_myPos != null) _mapController.move(_myPos!, 16);
     } catch (_) {
       // seguimos igual
@@ -206,22 +229,23 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
             accuracy: LocationAccuracy.bestForNavigation,
             distanceFilter: 5,
           ),
-        ).listen((pos) async {
+        ).listen((pos) {
+          if (!mounted) return;
           _setMyPos(pos);
 
+          final now = DateTime.now();
           if (_trackingRoute && _routeLine.isNotEmpty && _myPos != null) {
-            _updateDistanceToNext();
-            _trimRouteByProgress();
-            await _maybeRerouteIfOffRoute();
+            _updateDistanceToNext(now: now);
+            _trimRouteByProgress(now: now);
+            unawaited(_maybeRerouteIfOffRoute(now: now));
           } else {
-            _updateDistanceToNext();
+            _updateDistanceToNext(now: now);
           }
         });
   }
 
   void _setMyPos(Position p) {
     _myPos = LatLng(p.latitude, p.longitude);
-    if (mounted) setState(() {});
   }
 
   void _centerOnMe() {
@@ -320,14 +344,16 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
 
       _routeLine = [];
       _trackingRoute = false;
-      _offRoute = false;
-      _metersToNext = null;
-      _showArrivePrompt = false;
+      _lastTrimBestIdx = 0;
+      _lastOffRouteBestIdx = 0;
+      _setOffRoute(false);
+      _setMetersToNext(null, force: true);
+      _setShowArrivePrompt(false);
 
       // si había start/end seteados, los dejamos, pero si quedaron fuera de rango, se limpian
       _sanitizeStartEnd();
     });
-    _updateDistanceToNext();
+    _updateDistanceToNext(force: true);
   }
 
   void _removeCheckpoint(int index) {
@@ -337,13 +363,15 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
 
       _routeLine = [];
       _trackingRoute = false;
-      _offRoute = false;
-      _metersToNext = null;
-      _showArrivePrompt = false;
+      _lastTrimBestIdx = 0;
+      _lastOffRouteBestIdx = 0;
+      _setOffRoute(false);
+      _setMetersToNext(null, force: true);
+      _setShowArrivePrompt(false);
 
       _sanitizeStartEnd();
     });
-    _updateDistanceToNext();
+    _updateDistanceToNext(force: true);
   }
 
   void _clearAll() {
@@ -353,9 +381,11 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
 
       _routeLine = [];
       _trackingRoute = false;
-      _offRoute = false;
-      _metersToNext = null;
-      _showArrivePrompt = false;
+      _lastTrimBestIdx = 0;
+      _lastOffRouteBestIdx = 0;
+      _setOffRoute(false);
+      _setMetersToNext(null, force: true);
+      _setShowArrivePrompt(false);
       _arrivePromptSnoozeUntil = DateTime.fromMillisecondsSinceEpoch(0);
 
       _startCheckpointNumber = null;
@@ -374,9 +404,11 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     setState(() {
       _routeLine = [];
       _trackingRoute = false;
-      _offRoute = false;
-      _metersToNext = null;
-      _showArrivePrompt = false;
+      _lastTrimBestIdx = 0;
+      _lastOffRouteBestIdx = 0;
+      _setOffRoute(false);
+      _setMetersToNext(null, force: true);
+      _setShowArrivePrompt(false);
 
       _sanitizeStartEnd();
     });
@@ -392,17 +424,19 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
       setState(() {
         _routeLine = [];
         _trackingRoute = false;
-        _offRoute = false;
-        _navMode = false;
+        _lastTrimBestIdx = 0;
+        _lastOffRouteBestIdx = 0;
+        _setOffRoute(false);
+        _setNavMode(false);
       });
     } else {
-      _updateDistanceToNext();
+      _updateDistanceToNext(force: true);
     }
   }
 
   Future<void> _confirmArrived() async {
     setState(() {
-      _showArrivePrompt = false;
+      _setShowArrivePrompt(false);
       _arrivePromptSnoozeUntil = DateTime.fromMillisecondsSinceEpoch(0);
     });
     await _arrivedManual();
@@ -410,7 +444,7 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
 
   void _snoozeArrivePrompt() {
     setState(() {
-      _showArrivePrompt = false;
+      _setShowArrivePrompt(false);
       _arrivePromptSnoozeUntil = DateTime.now().add(
         const Duration(seconds: 30),
       );
@@ -458,7 +492,7 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
       _checkpoints.removeAt(0);
     }
     _navQueue = List<LatLng>.from(_checkpoints);
-    if (_checkpoints.isEmpty) _showArrivePrompt = false;
+    if (_checkpoints.isEmpty) _setShowArrivePrompt(false);
   }
 
   void _sanitizeStartEnd() {
@@ -466,7 +500,7 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     if (n == 0) {
       _startCheckpointNumber = null;
       _endCheckpointNumber = null;
-      _showArrivePrompt = false;
+      _setShowArrivePrompt(false);
       return;
     }
     if (_startCheckpointNumber != null &&
@@ -521,10 +555,12 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
       _navQueue = List<LatLng>.from(_checkpoints);
       _routeLine = [];
       _trackingRoute = false;
-      _offRoute = false;
-      _showArrivePrompt = false;
+      _lastTrimBestIdx = 0;
+      _lastOffRouteBestIdx = 0;
+      _setOffRoute(false);
+      _setShowArrivePrompt(false);
       _arrivePromptSnoozeUntil = DateTime.fromMillisecondsSinceEpoch(0);
-      _navMode = false;
+      _setNavMode(false);
     });
   }
 
@@ -547,11 +583,9 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
       return;
     }
 
-    setState(() {
-      _buildingRoute = true;
-      _offRoute = false;
-      _showArrivePrompt = false;
-    });
+    _setBuildingRoute(true);
+    _setOffRoute(false);
+    _setShowArrivePrompt(false);
 
     try {
       final wasTracking = _trackingRoute;
@@ -595,21 +629,23 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
       setState(() {
         _routeLine = line;
         _trackingRoute = true;
-        _navMode = true;
-        _showArrivePrompt = false;
+        _lastTrimBestIdx = 0;
+        _lastOffRouteBestIdx = 0;
+        _setNavMode(true);
+        _setShowArrivePrompt(false);
       });
 
       if (!wasTracking) {
         _startTripTracking(ordered, _polylineDistanceMeters(line));
       }
 
-      _updateDistanceToNext();
-      _trimRouteByProgress();
+      _updateDistanceToNext(force: true);
+      _trimRouteByProgress(force: true);
     } catch (_) {
       _snack('Error construyendo ruta.');
     } finally {
       if (mounted) {
-        setState(() => _buildingRoute = false);
+        _setBuildingRoute(false);
       }
     }
   }
@@ -875,15 +911,65 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     _activeTripDistanceMeters = null;
   }
 
+  bool _distanceChangedSignificantly(
+    double? current,
+    double? next, {
+    required double minDeltaMeters,
+  }) {
+    if (current == null || next == null) return current != next;
+    return (current - next).abs() >= minDeltaMeters;
+  }
+
+  bool _setMetersToNext(
+    double? meters, {
+    bool force = false,
+    double minDeltaMeters = 0,
+  }) {
+    if (!force &&
+        !_distanceChangedSignificantly(
+          _metersToNext,
+          meters,
+          minDeltaMeters: minDeltaMeters,
+        )) {
+      return false;
+    }
+    _metersToNext = meters;
+    _metersToNextNotifier.value = meters;
+    return true;
+  }
+
+  void _setOffRoute(bool value) {
+    if (_offRoute == value) return;
+    _offRoute = value;
+    _offRouteNotifier.value = value;
+  }
+
+  void _setShowArrivePrompt(bool value) {
+    if (_showArrivePrompt == value) return;
+    _showArrivePrompt = value;
+    _showArrivePromptNotifier.value = value;
+  }
+
+  void _setBuildingRoute(bool value) {
+    if (_buildingRoute == value) return;
+    _buildingRoute = value;
+    _buildingRouteNotifier.value = value;
+  }
+
+  void _setNavMode(bool value) {
+    if (_navMode == value) return;
+    _navMode = value;
+    _navModeNotifier.value = value;
+  }
+
   // ---------------------------
   // NAV LOGIC: distancia, recorte, reroute
   // ---------------------------
-  void _updateDistanceToNext() {
+  void _updateDistanceToNext({DateTime? now, bool force = false}) {
+    final currentNow = now ?? DateTime.now();
     if (_myPos == null) {
-      setState(() {
-        _metersToNext = null;
-        _showArrivePrompt = false;
-      });
+      _setMetersToNext(null, force: true);
+      _setShowArrivePrompt(false);
       return;
     }
 
@@ -892,37 +978,48 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
         ? _navQueue.first
         : (_checkpoints.isNotEmpty ? _checkpoints.first : null);
     if (next == null) {
-      setState(() {
-        _metersToNext = null;
-        _showArrivePrompt = false;
-      });
+      _setMetersToNext(null, force: true);
+      _setShowArrivePrompt(false);
       return;
     }
 
     final d = _distance(_myPos!, next).toDouble();
-    final now = DateTime.now();
     final canPrompt = _navMode && _trackingRoute;
     final inPromptRange = d <= _manualArriveUiThresholdMeters;
-    final snoozeExpired = !now.isBefore(_arrivePromptSnoozeUntil);
+    final snoozeExpired = !currentNow.isBefore(_arrivePromptSnoozeUntil);
+    final promptVisible = canPrompt && inPromptRange && snoozeExpired;
 
-    setState(() {
-      _metersToNext = d;
-      if (!canPrompt || !inPromptRange) {
-        _showArrivePrompt = false;
-      } else if (snoozeExpired) {
-        _showArrivePrompt = true;
-      }
-    });
+    final intervalElapsed =
+        currentNow.difference(_lastDistanceUiUpdate) >= _distanceUiMinInterval;
+    if (force || intervalElapsed) {
+      _setMetersToNext(d, force: true);
+      _lastDistanceUiUpdate = currentNow;
+    } else {
+      final changed = _setMetersToNext(
+        d,
+        minDeltaMeters: _distanceUiMinDeltaMeters,
+      );
+      if (changed) _lastDistanceUiUpdate = currentNow;
+    }
+
+    _setShowArrivePrompt(promptVisible);
   }
 
-  void _trimRouteByProgress() {
+  void _trimRouteByProgress({DateTime? now, bool force = false}) {
     final here = _myPos;
     if (here == null || _routeLine.length < 2) return;
+    final currentNow = now ?? DateTime.now();
+    if (!force && currentNow.difference(_lastTrimAt) < _trimMinInterval) return;
+    _lastTrimAt = currentNow;
 
-    int bestIdx = 0;
+    final lineLen = _routeLine.length;
+    final start = math.max(0, _lastTrimBestIdx - 25);
+    final end = math.min(lineLen - 1, _lastTrimBestIdx + 160);
+
+    int bestIdx = start;
     double best = double.infinity;
 
-    for (int i = 0; i < _routeLine.length; i++) {
+    for (int i = start; i <= end; i++) {
       final d = _distance(here, _routeLine[i]).toDouble();
       if (d < best) {
         best = d;
@@ -930,24 +1027,56 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
       }
     }
 
+    if (best > (_trimSnapThresholdMeters * 2)) {
+      for (int i = 0; i < lineLen; i += 5) {
+        final d = _distance(here, _routeLine[i]).toDouble();
+        if (d < best) {
+          best = d;
+          bestIdx = i;
+        }
+      }
+    }
+
+    _lastTrimBestIdx = bestIdx;
     if (best <= _trimSnapThresholdMeters && bestIdx > 2) {
       setState(() {
         _routeLine = _routeLine.sublist(bestIdx);
+        _lastTrimBestIdx = 0;
+        _lastOffRouteBestIdx = 0;
       });
     }
   }
 
   double _minDistanceToPolylineMeters(LatLng here, List<LatLng> line) {
     if (line.isEmpty) return double.infinity;
+    final lineLen = line.length;
+    final start = math.max(0, _lastOffRouteBestIdx - 25);
+    final end = math.min(lineLen - 1, _lastOffRouteBestIdx + 220);
+    int bestIdx = start;
     double best = double.infinity;
-    for (final p in line) {
-      final d = _distance(here, p).toDouble();
-      if (d < best) best = d;
+    for (int i = start; i <= end; i++) {
+      final d = _distance(here, line[i]).toDouble();
+      if (d < best) {
+        best = d;
+        bestIdx = i;
+      }
     }
+
+    if (best > (_offRouteThresholdMeters * 1.2)) {
+      for (int i = 0; i < lineLen; i += 6) {
+        final d = _distance(here, line[i]).toDouble();
+        if (d < best) {
+          best = d;
+          bestIdx = i;
+        }
+      }
+    }
+    _lastOffRouteBestIdx = bestIdx;
     return best;
   }
 
-  Future<void> _maybeRerouteIfOffRoute() async {
+  Future<void> _maybeRerouteIfOffRoute({DateTime? now}) async {
+    if (_rerouteInFlight) return;
     final here = _myPos;
     if (here == null) return;
     if (_routeLine.isEmpty) return;
@@ -955,18 +1084,28 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     final remaining = _navQueue.isNotEmpty ? _navQueue : _checkpoints;
     if (remaining.isEmpty) return;
 
-    final now = DateTime.now();
-    if (now.difference(_lastReroute).inSeconds < _minSecondsBetweenReroutes)
+    final currentNow = now ?? DateTime.now();
+    if (currentNow.difference(_lastOffRouteCheckAt) < _offRouteCheckMinInterval) {
+      return;
+    }
+    _lastOffRouteCheckAt = currentNow;
+
+    if (currentNow.difference(_lastReroute).inSeconds < _minSecondsBetweenReroutes)
       return;
 
     final distToLine = _minDistanceToPolylineMeters(here, _routeLine);
 
     final off = distToLine >= _offRouteThresholdMeters;
-    if (off != _offRoute) setState(() => _offRoute = off);
+    _setOffRoute(off);
 
     if (off) {
-      _lastReroute = now;
-      await _buildRoute();
+      _lastReroute = currentNow;
+      _rerouteInFlight = true;
+      try {
+        await _buildRoute();
+      } finally {
+        _rerouteInFlight = false;
+      }
     }
   }
 
@@ -985,15 +1124,17 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
 
   void _cancelTrip() {
     setState(() {
-      _navMode = false;
+      _setNavMode(false);
       _trackingRoute = false;
       _routeLine = [];
-      _offRoute = false;
-      _showArrivePrompt = false;
+      _lastTrimBestIdx = 0;
+      _lastOffRouteBestIdx = 0;
+      _setOffRoute(false);
+      _setShowArrivePrompt(false);
       _arrivePromptSnoozeUntil = DateTime.fromMillisecondsSinceEpoch(0);
     });
     _resetActiveTripTracking();
-    _updateDistanceToNext();
+    _updateDistanceToNext(force: true);
   }
 
   void _exitNavMode() {
@@ -1039,7 +1180,7 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
       right: 16,
       bottom: 98,
       child: Material(
-        color: Colors.white.withOpacity(0.97),
+        color: Colors.white.withValues(alpha: 0.97),
         borderRadius: BorderRadius.circular(16),
         elevation: 4,
         child: Padding(
@@ -1102,13 +1243,13 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
                 child: Container(
                   height: 46,
                   decoration: BoxDecoration(
-                    color: Colors.white.withOpacity(0.95),
+                    color: Colors.white.withValues(alpha: 0.95),
                     borderRadius: BorderRadius.circular(16),
                     boxShadow: [
                       BoxShadow(
                         blurRadius: 12,
                         offset: const Offset(0, 6),
-                        color: Colors.black.withOpacity(0.06),
+                        color: Colors.black.withValues(alpha: 0.06),
                       ),
                     ],
                   ),
@@ -1146,13 +1287,13 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
                         vertical: 10,
                       ),
                       decoration: BoxDecoration(
-                        color: Colors.white.withOpacity(0.95),
+                        color: Colors.white.withValues(alpha: 0.95),
                         borderRadius: BorderRadius.circular(16),
                         boxShadow: [
                           BoxShadow(
                             blurRadius: 12,
                             offset: const Offset(0, 6),
-                            color: Colors.black.withOpacity(0.06),
+                            color: Colors.black.withValues(alpha: 0.06),
                           ),
                         ],
                       ),
@@ -1195,13 +1336,13 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
         decoration: BoxDecoration(
-          color: Colors.white.withOpacity(0.95),
+          color: Colors.white.withValues(alpha: 0.95),
           borderRadius: BorderRadius.circular(18),
           boxShadow: [
             BoxShadow(
               blurRadius: 12,
               offset: const Offset(0, 6),
-              color: Colors.black.withOpacity(0.06),
+              color: Colors.black.withValues(alpha: 0.06),
             ),
           ],
         ),
@@ -1261,13 +1402,13 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
                 width: double.infinity,
                 padding: const EdgeInsets.all(10),
                 decoration: BoxDecoration(
-                  color: Colors.white.withOpacity(0.95),
+                  color: Colors.white.withValues(alpha: 0.95),
                   borderRadius: BorderRadius.circular(16),
                   boxShadow: [
                     BoxShadow(
                       blurRadius: 12,
                       offset: const Offset(0, 6),
-                      color: Colors.black.withOpacity(0.06),
+                      color: Colors.black.withValues(alpha: 0.06),
                     ),
                   ],
                 ),
@@ -1387,10 +1528,6 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final distText = _metersToNext == null
-        ? null
-        : _formatMeters(_metersToNext!);
-
     return Scaffold(
       drawer: _AppDrawer(
         onSavedLocations: _openSavedLocations,
@@ -1400,63 +1537,106 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
         child: Stack(
           children: [
             Positioned.fill(
-              child: FlutterMap(
+              child: _MapCanvas(
                 mapController: _mapController,
-                options: MapOptions(
-                  initialCenter: _center,
-                  initialZoom: _zoom,
-                  onTap: (_, latLng) => _handleMapTap(latLng),
-                ),
-                children: [
-                  TileLayer(
-                    urlTemplate:
-                        'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                    userAgentPackageName: 'com.example.como_llego',
-                  ),
-                  CurrentLocationLayer(
-                    alignPositionOnUpdate: AlignOnUpdate.never,
-                    alignDirectionOnUpdate: AlignOnUpdate.never,
-                    style: const LocationMarkerStyle(
-                      marker: DefaultLocationMarker(
-                        child: Icon(
-                          Icons.navigation,
-                          color: Colors.white,
-                          size: 14,
-                        ),
-                      ),
-                      markerSize: Size(34, 34),
-                      accuracyCircleColor: Color(0x334E9BFF),
-                      headingSectorColor: Color(0x334E9BFF),
-                      headingSectorRadius: 80,
-                    ),
-                  ),
-                  if (_routeLine.isNotEmpty)
-                    PolylineLayer(
-                      polylines: [Polyline(points: _routeLine, strokeWidth: 5)],
-                    ),
-                  MarkerLayer(
-                    markers: [
-                      for (int i = 0; i < _checkpoints.length; i++)
-                        Marker(
-                          point: _checkpoints[i],
-                          width: 44,
-                          height: 44,
-                          child: _CheckpointMarker(index: i + 1),
-                        ),
-                    ],
-                  ),
-                ],
+                center: _center,
+                zoom: _zoom,
+                routeLine: _routeLine,
+                checkpoints: _checkpoints,
+                onTap: _handleMapTap,
               ),
             ),
-
-            if (!_navMode) ..._buildNormalTopUi(distText),
-            if (_navMode) _buildNavTopUi(distText),
-            _buildBottomUi(),
-            if (_showArrivePrompt && _navMode && _nextCheckpointForUi() != null)
-              _buildArrivePromptOverlay(),
+            Positioned.fill(
+              child: AnimatedBuilder(
+                animation: Listenable.merge([
+                  _metersToNextNotifier,
+                  _offRouteNotifier,
+                  _showArrivePromptNotifier,
+                  _buildingRouteNotifier,
+                  _navModeNotifier,
+                ]),
+                builder: (context, _) {
+                  final meters = _metersToNextNotifier.value;
+                  final distText = meters == null ? null : _formatMeters(meters);
+                  return Stack(
+                    children: [
+                      if (!_navMode) ..._buildNormalTopUi(distText),
+                      if (_navMode) _buildNavTopUi(distText),
+                      _buildBottomUi(),
+                      if (_showArrivePrompt &&
+                          _navMode &&
+                          _nextCheckpointForUi() != null)
+                        _buildArrivePromptOverlay(),
+                    ],
+                  );
+                },
+              ),
+            ),
           ],
         ),
       ),
+    );
+  }
+}
+
+class _MapCanvas extends StatelessWidget {
+  final MapController mapController;
+  final LatLng center;
+  final double zoom;
+  final List<LatLng> routeLine;
+  final List<LatLng> checkpoints;
+  final void Function(LatLng) onTap;
+
+  const _MapCanvas({
+    required this.mapController,
+    required this.center,
+    required this.zoom,
+    required this.routeLine,
+    required this.checkpoints,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return FlutterMap(
+      mapController: mapController,
+      options: MapOptions(
+        initialCenter: center,
+        initialZoom: zoom,
+        onTap: (_, latLng) => onTap(latLng),
+      ),
+      children: [
+        TileLayer(
+          urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+          userAgentPackageName: 'com.example.como_llego',
+        ),
+        CurrentLocationLayer(
+          alignPositionOnUpdate: AlignOnUpdate.never,
+          alignDirectionOnUpdate: AlignOnUpdate.never,
+          style: const LocationMarkerStyle(
+            marker: DefaultLocationMarker(
+              child: Icon(Icons.navigation, color: Colors.white, size: 14),
+            ),
+            markerSize: Size(34, 34),
+            accuracyCircleColor: Color(0x334E9BFF),
+            headingSectorColor: Color(0x334E9BFF),
+            headingSectorRadius: 80,
+          ),
+        ),
+        if (routeLine.isNotEmpty)
+          PolylineLayer(polylines: [Polyline(points: routeLine, strokeWidth: 5)]),
+        MarkerLayer(
+          markers: [
+            for (int i = 0; i < checkpoints.length; i++)
+              Marker(
+                point: checkpoints[i],
+                width: 44,
+                height: 44,
+                child: _CheckpointMarker(index: i + 1),
+              ),
+          ],
+        ),
+      ],
     );
   }
 }
@@ -1779,7 +1959,7 @@ class _SavedLocationsScreenState extends State<_SavedLocationsScreen> {
               itemBuilder: (context, i) {
                 final it = _items[i];
                 return Material(
-                  color: Colors.white.withOpacity(0.95),
+                  color: Colors.white.withValues(alpha: 0.95),
                   borderRadius: BorderRadius.circular(18),
                   elevation: 1,
                   child: InkWell(
@@ -1981,7 +2161,7 @@ class _IconPill extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Material(
-      color: Colors.white.withOpacity(0.95),
+      color: Colors.white.withValues(alpha: 0.95),
       borderRadius: BorderRadius.circular(16),
       child: InkWell(
         borderRadius: BorderRadius.circular(16),
@@ -2006,7 +2186,7 @@ class _CheckpointMarker extends StatelessWidget {
           BoxShadow(
             blurRadius: 10,
             offset: const Offset(0, 6),
-            color: Colors.black.withOpacity(0.15),
+            color: Colors.black.withValues(alpha: 0.15),
           ),
         ],
       ),
@@ -2199,3 +2379,4 @@ class _TripHistoryScreen extends StatelessWidget {
     );
   }
 }
+
