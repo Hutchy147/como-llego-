@@ -56,7 +56,6 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
   // Tracking ubicación
   LatLng? _myPos;
   StreamSubscription<Position>? _posSub;
-  bool _locationReady = false;
 
   // UI estado
   bool _buildingRoute = false;
@@ -66,10 +65,18 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
   bool _offRoute = false;
   bool _showArrivePrompt = false;
   DateTime _arrivePromptSnoozeUntil = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastNavTapSnack = DateTime.fromMillisecondsSinceEpoch(0);
 
   // Ubicaciones guardadas (persistidas)
   final List<_SavedLocation> _savedLocations = [];
   static const String _prefsSavedLocationsKey = 'saved_locations_v1';
+  static const String _prefsTripHistoryKey = 'trip_history_v1';
+
+  // Historial de viajes (persistido)
+  final List<_TripHistoryEntry> _tripHistory = [];
+  DateTime? _activeTripStartTime;
+  List<LatLng> _activeTripCheckpoints = [];
+  double? _activeTripDistanceMeters;
 
   // Selección de inicio/fin (1-based para UI)
   int? _startCheckpointNumber; // ej: 4
@@ -87,6 +94,7 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
   void initState() {
     super.initState();
     _loadSavedLocations(); // persistencia
+    _loadTripHistory();
     _initLocation();
   }
 
@@ -131,6 +139,40 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     }
   }
 
+  Future<void> _loadTripHistory() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_prefsTripHistoryKey);
+      if (raw == null || raw.trim().isEmpty) return;
+
+      final list = jsonDecode(raw) as List<dynamic>;
+      final parsed =
+          list
+              .map((e) => _TripHistoryEntry.fromJson(e as Map<String, dynamic>))
+              .toList()
+            ..sort((a, b) => b.startTime.compareTo(a.startTime));
+
+      if (!mounted) return;
+      setState(() {
+        _tripHistory
+          ..clear()
+          ..addAll(parsed);
+      });
+    } catch (_) {
+      // no bloqueamos la app por datos corruptos
+    }
+  }
+
+  Future<void> _persistTripHistory() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = jsonEncode(_tripHistory.map((e) => e.toJson()).toList());
+      await prefs.setString(_prefsTripHistoryKey, raw);
+    } catch (_) {
+      // no bloqueamos UX por persistencia
+    }
+  }
+
   // ---------------------------
   // LOCATION
   // ---------------------------
@@ -142,7 +184,8 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     if (perm == LocationPermission.denied) {
       perm = await Geolocator.requestPermission();
     }
-    if (perm == LocationPermission.deniedForever || perm == LocationPermission.denied) {
+    if (perm == LocationPermission.deniedForever ||
+        perm == LocationPermission.denied) {
       return;
     }
 
@@ -151,29 +194,29 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
         desiredAccuracy: LocationAccuracy.bestForNavigation,
       );
       _setMyPos(p);
-      _locationReady = true;
       if (mounted) setState(() {});
       if (_myPos != null) _mapController.move(_myPos!, 16);
     } catch (_) {
       // seguimos igual
     }
 
-    _posSub = Geolocator.getPositionStream(
-      locationSettings: const LocationSettings(
-        accuracy: LocationAccuracy.bestForNavigation,
-        distanceFilter: 5,
-      ),
-    ).listen((pos) async {
-      _setMyPos(pos);
+    _posSub =
+        Geolocator.getPositionStream(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.bestForNavigation,
+            distanceFilter: 5,
+          ),
+        ).listen((pos) async {
+          _setMyPos(pos);
 
-      if (_trackingRoute && _routeLine.isNotEmpty && _myPos != null) {
-        _updateDistanceToNext();
-        _trimRouteByProgress();
-        await _maybeRerouteIfOffRoute();
-      } else {
-        _updateDistanceToNext();
-      }
-    });
+          if (_trackingRoute && _routeLine.isNotEmpty && _myPos != null) {
+            _updateDistanceToNext();
+            _trimRouteByProgress();
+            await _maybeRerouteIfOffRoute();
+          } else {
+            _updateDistanceToNext();
+          }
+        });
   }
 
   void _setMyPos(Position p) {
@@ -194,9 +237,8 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
       context: context,
       isScrollControlled: true,
       showDragHandle: true,
-      builder: (_) => _SearchSheet(
-        onSearch: _nominatimSearch,
-      ),
+      builder: (_) =>
+          _SearchSheet(onSearch: _nominatimSearch, favorites: _savedLocations),
     );
 
     if (picked == null) return;
@@ -215,9 +257,12 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
       '&bounded=1',
     );
 
-    final resp = await http.get(url, headers: {
-      'User-Agent': 'como-llego-app/1.0 (contact: mateogomez3521@gmail.com)',
-    });
+    final resp = await http.get(
+      url,
+      headers: {
+        'User-Agent': 'como-llego-app/1.0 (contact: mateogomez3521@gmail.com)',
+      },
+    );
 
     if (resp.statusCode != 200) return [];
 
@@ -316,10 +361,11 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
       _startCheckpointNumber = null;
       _endCheckpointNumber = null;
     });
+    _resetActiveTripTracking();
   }
 
   // “Llegué” manual: elimina el checkpoint actual (primero de la cola)
-  void _arrivedManual() {
+  Future<void> _arrivedManual() async {
     if (_navQueue.isEmpty && _checkpoints.isEmpty) return;
 
     final next = _navQueue.isNotEmpty ? _navQueue.first : _checkpoints.first;
@@ -337,25 +383,58 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
 
     // si quedan, recalcula
     if (_checkpoints.length >= 2) {
-      _buildRoute();
+      await _buildRoute();
+      return;
+    }
+
+    if (_checkpoints.isEmpty) {
+      await _finishTripTracking();
+      setState(() {
+        _routeLine = [];
+        _trackingRoute = false;
+        _offRoute = false;
+        _navMode = false;
+      });
     } else {
       _updateDistanceToNext();
     }
   }
 
-  void _confirmArrived() {
+  Future<void> _confirmArrived() async {
     setState(() {
       _showArrivePrompt = false;
       _arrivePromptSnoozeUntil = DateTime.fromMillisecondsSinceEpoch(0);
     });
-    _arrivedManual();
+    await _arrivedManual();
   }
 
   void _snoozeArrivePrompt() {
     setState(() {
       _showArrivePrompt = false;
-      _arrivePromptSnoozeUntil = DateTime.now().add(const Duration(seconds: 30));
+      _arrivePromptSnoozeUntil = DateTime.now().add(
+        const Duration(seconds: 30),
+      );
     });
+  }
+
+  void _handleMapTap(LatLng latLng) {
+    if (_navMode) {
+      final now = DateTime.now();
+      if (now.difference(_lastNavTapSnack) >= const Duration(seconds: 1)) {
+        _lastNavTapSnack = now;
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Salir de navegación para agregar puntos'),
+              duration: Duration(seconds: 1),
+            ),
+          );
+        }
+      }
+      return;
+    }
+
+    _addCheckpoint(latLng);
   }
 
   void _removeCheckpointByPoint(LatLng target) {
@@ -405,64 +484,47 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
       // si son iguales y hay más de uno, no tiene sentido: dejamos end null
       _endCheckpointNumber = null;
     }
+    if (_endCheckpointNumber == null &&
+        _startCheckpointNumber != null &&
+        _startCheckpointNumber == n &&
+        n > 1) {
+      // end default = ultimo checkpoint, evitamos conflicto start==end.
+      _startCheckpointNumber = null;
+    }
   }
 
   // ---------------------------
-  // START / END UI
+  // CONFIGURACION de inicio / fin
   // ---------------------------
-  Future<void> _pickStartCheckpoint() async {
+  Future<void> _openRouteConfigSheet() async {
     if (_checkpoints.isEmpty) {
-      _snack('Primero agregá checkpoints.');
+      _snack('Primero agrega checkpoints.');
       return;
     }
 
-    final picked = await showModalBottomSheet<int>(
+    final result = await showModalBottomSheet<_RouteConfigResult>(
       context: context,
+      isScrollControlled: true,
       showDragHandle: true,
-      builder: (_) => _PickCheckpointSheet(
-        title: 'Elegir INICIO',
+      builder: (_) => _RouteConfigSheet(
         count: _checkpoints.length,
-        selected: _startCheckpointNumber,
-        allowNone: true,
-        noneLabel: 'Desde mi ubicación (default)',
+        initialStart: _startCheckpointNumber,
+        initialEnd: _endCheckpointNumber,
       ),
     );
 
-    if (picked == null) return;
+    if (result == null) return;
     setState(() {
-      _startCheckpointNumber = picked == 0 ? null : picked;
+      _startCheckpointNumber = result.startCheckpointNumber;
+      _endCheckpointNumber = result.endCheckpointNumber;
       _sanitizeStartEnd();
+      _navQueue = List<LatLng>.from(_checkpoints);
       _routeLine = [];
       _trackingRoute = false;
       _offRoute = false;
-    });
-  }
-
-  Future<void> _pickEndCheckpoint() async {
-    if (_checkpoints.isEmpty) {
-      _snack('Primero agregá checkpoints.');
-      return;
-    }
-
-    final picked = await showModalBottomSheet<int>(
-      context: context,
-      showDragHandle: true,
-      builder: (_) => _PickCheckpointSheet(
-        title: 'Elegir FINAL',
-        count: _checkpoints.length,
-        selected: _endCheckpointNumber,
-        allowNone: true,
-        noneLabel: 'Último checkpoint (default)',
-      ),
-    );
-
-    if (picked == null) return;
-    setState(() {
-      _endCheckpointNumber = picked == 0 ? null : picked;
-      _sanitizeStartEnd();
-      _routeLine = [];
-      _trackingRoute = false;
-      _offRoute = false;
+      _showArrivePrompt = false;
+      _arrivePromptSnoozeUntil = DateTime.fromMillisecondsSinceEpoch(0);
+      _navMode = false;
     });
   }
 
@@ -479,7 +541,9 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
 
     final startPos = _myPos;
     if (startPos == null) {
-      _snack('No tengo tu ubicación todavía. Activá ubicación o esperá el fix.');
+      _snack(
+        'No tengo tu ubicación todavía. Activá ubicación o esperá el fix.',
+      );
       return;
     }
 
@@ -490,7 +554,8 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     });
 
     try {
-      final ordered = _buildOrderedWaypointsFromSelection();
+      final wasTracking = _trackingRoute;
+      final ordered = await _buildOrderedWaypointsForRoute(startPos);
 
       // cola de navegación = el orden elegido (sin mi posición)
       setState(() {
@@ -499,7 +564,9 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
 
       // points = mi ubicación + ordered
       final points = <LatLng>[startPos, ...ordered];
-      final coords = points.map((p) => '${p.longitude},${p.latitude}').join(';');
+      final coords = points
+          .map((p) => '${p.longitude},${p.latitude}')
+          .join(';');
 
       final url = Uri.parse(
         'https://router.project-osrm.org/route/v1/driving/$coords'
@@ -518,8 +585,11 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
         return;
       }
 
-      final coordsList = data['routes'][0]['geometry']['coordinates'] as List<dynamic>;
-      final line = coordsList.map((c) => LatLng(c[1].toDouble(), c[0].toDouble())).toList();
+      final coordsList =
+          data['routes'][0]['geometry']['coordinates'] as List<dynamic>;
+      final line = coordsList
+          .map((c) => LatLng(c[1].toDouble(), c[0].toDouble()))
+          .toList();
 
       if (!mounted) return;
       setState(() {
@@ -528,6 +598,10 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
         _navMode = true;
         _showArrivePrompt = false;
       });
+
+      if (!wasTracking) {
+        _startTripTracking(ordered, _polylineDistanceMeters(line));
+      }
 
       _updateDistanceToNext();
       _trimRouteByProgress();
@@ -540,54 +614,265 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     }
   }
 
-  // Construye el orden final según start/end:
-  // - Si no se elige nada: usa el orden actual de _checkpoints
-  // - Si se elige start X y end Y:
-  //   orden = [start] + [resto (manteniendo orden original) sin start/end] + [end]
-  List<LatLng> _buildOrderedWaypointsFromSelection() {
+  Future<List<LatLng>> _buildOrderedWaypointsForRoute(LatLng startPos) async {
+    final cps = List<LatLng>.from(_checkpoints);
+    if (cps.length < 3) {
+      return _baseOrderedWaypoints();
+    }
+
+    final matrix = await _fetchOsrmDurationMatrix(cps);
+    if (matrix == null) {
+      return _baseOrderedWaypoints();
+    }
+
+    final optimized = _optimizeCheckpointOrder(
+      checkpoints: cps,
+      durationMatrix: matrix,
+      startPos: startPos,
+    );
+    if (optimized.isEmpty) {
+      return _baseOrderedWaypoints();
+    }
+    return optimized;
+  }
+
+  List<LatLng> _baseOrderedWaypoints() {
     final cps = List<LatLng>.from(_checkpoints);
     final n = cps.length;
-
-    final s = _startCheckpointNumber;
-    final e = _endCheckpointNumber;
-
     if (n <= 1) return cps;
 
-    final hasStart = s != null && s >= 1 && s <= n;
-    final hasEnd = e != null && e >= 1 && e <= n;
+    final fixedStartIdx =
+        (_startCheckpointNumber != null &&
+            _startCheckpointNumber! >= 1 &&
+            _startCheckpointNumber! <= n)
+        ? _startCheckpointNumber! - 1
+        : null;
+    final fixedEndIdx =
+        (_endCheckpointNumber != null &&
+            _endCheckpointNumber! >= 1 &&
+            _endCheckpointNumber! <= n)
+        ? _endCheckpointNumber! - 1
+        : n - 1;
 
-    if (!hasStart && !hasEnd) {
+    if (fixedStartIdx != null && fixedStartIdx == fixedEndIdx && n > 1) {
       return cps;
     }
 
-    LatLng? startCp = hasStart ? cps[s! - 1] : null;
-    LatLng? endCp = hasEnd ? cps[e! - 1] : null;
-
-    // si start/end son iguales o inválidos, caemos al orden normal
-    if (startCp != null && endCp != null) {
-      final d = _distance(startCp, endCp).toDouble();
-      if (d < 1) return cps;
-    }
-
-    final middle = <LatLng>[];
+    final result = <LatLng>[];
+    if (fixedStartIdx != null) result.add(cps[fixedStartIdx]);
     for (int i = 0; i < cps.length; i++) {
-      final p = cps[i];
-      final isStart = (startCp != null) && _distance(p, startCp).toDouble() < 1;
-      final isEnd = (endCp != null) && _distance(p, endCp).toDouble() < 1;
-      if (!isStart && !isEnd) middle.add(p);
+      if (i == fixedStartIdx || i == fixedEndIdx) continue;
+      result.add(cps[i]);
+    }
+    result.add(cps[fixedEndIdx]);
+    return result;
+  }
+
+  Future<List<List<double>>?> _fetchOsrmDurationMatrix(
+    List<LatLng> points,
+  ) async {
+    try {
+      final coords = points
+          .map((p) => '${p.longitude},${p.latitude}')
+          .join(';');
+      final url = Uri.parse(
+        'https://router.project-osrm.org/table/v1/driving/$coords?annotations=duration',
+      );
+      final resp = await http.get(url);
+      if (resp.statusCode != 200) return null;
+      final data = jsonDecode(resp.body) as Map<String, dynamic>;
+      if (data['code'] != 'Ok') return null;
+
+      final durations = data['durations'] as List<dynamic>;
+      return durations
+          .map(
+            (row) => (row as List<dynamic>)
+                .map((v) => (v as num?)?.toDouble() ?? double.infinity)
+                .toList(),
+          )
+          .toList();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  List<LatLng> _optimizeCheckpointOrder({
+    required List<LatLng> checkpoints,
+    required List<List<double>> durationMatrix,
+    required LatLng startPos,
+  }) {
+    final n = checkpoints.length;
+    int? fixedStartIdx;
+    int? fixedEndIdx;
+
+    if (_startCheckpointNumber != null &&
+        _startCheckpointNumber! >= 1 &&
+        _startCheckpointNumber! <= n) {
+      fixedStartIdx = _startCheckpointNumber! - 1;
+    }
+    if (_endCheckpointNumber != null &&
+        _endCheckpointNumber! >= 1 &&
+        _endCheckpointNumber! <= n) {
+      fixedEndIdx = _endCheckpointNumber! - 1;
+    } else if (n > 0) {
+      fixedEndIdx = n - 1;
     }
 
-    if (startCp == null && endCp != null) {
-      // solo end: todo menos end + end
-      return [...middle, endCp];
-    }
-    if (startCp != null && endCp == null) {
-      // solo start: start + resto
-      return [startCp, ...middle];
+    if (fixedStartIdx != null &&
+        fixedEndIdx != null &&
+        fixedStartIdx == fixedEndIdx) {
+      return _baseOrderedWaypoints();
     }
 
-    // start + middle + end
-    return [startCp!, ...middle, endCp!];
+    final middle = <int>[];
+    for (int i = 0; i < n; i++) {
+      if (i == fixedStartIdx || i == fixedEndIdx) continue;
+      middle.add(i);
+    }
+
+    final nnMiddle = _nearestNeighborOrder(
+      candidates: middle,
+      durationMatrix: durationMatrix,
+      startPos: startPos,
+      checkpoints: checkpoints,
+      startIndex: fixedStartIdx,
+    );
+
+    final seq = <int>[];
+    if (fixedStartIdx != null) seq.add(fixedStartIdx);
+    seq.addAll(nnMiddle);
+    if (fixedEndIdx != null) seq.add(fixedEndIdx);
+
+    final improved = _twoOptImprove(
+      seq: seq,
+      durationMatrix: durationMatrix,
+      lockStart: fixedStartIdx != null,
+      lockEnd: fixedEndIdx != null,
+    );
+
+    return improved.map((i) => checkpoints[i]).toList();
+  }
+
+  List<int> _nearestNeighborOrder({
+    required List<int> candidates,
+    required List<List<double>> durationMatrix,
+    required LatLng startPos,
+    required List<LatLng> checkpoints,
+    required int? startIndex,
+  }) {
+    if (candidates.isEmpty) return [];
+    final remaining = List<int>.from(candidates);
+    final order = <int>[];
+    int? current = startIndex;
+
+    while (remaining.isNotEmpty) {
+      int best = remaining.first;
+      double bestScore = double.infinity;
+
+      for (final idx in remaining) {
+        final score = current == null
+            ? _distance(startPos, checkpoints[idx]).toDouble()
+            : durationMatrix[current][idx];
+        if (score < bestScore) {
+          bestScore = score;
+          best = idx;
+        }
+      }
+      order.add(best);
+      remaining.remove(best);
+      current = best;
+    }
+
+    return order;
+  }
+
+  List<int> _twoOptImprove({
+    required List<int> seq,
+    required List<List<double>> durationMatrix,
+    required bool lockStart,
+    required bool lockEnd,
+  }) {
+    if (seq.length < 4) return seq;
+    final best = List<int>.from(seq);
+    bool improved = true;
+
+    double cost(List<int> s) {
+      double total = 0;
+      for (int i = 0; i < s.length - 1; i++) {
+        total += durationMatrix[s[i]][s[i + 1]];
+      }
+      return total;
+    }
+
+    while (improved) {
+      improved = false;
+      final currentCost = cost(best);
+      final iStart = lockStart ? 1 : 0;
+      final kEnd = lockEnd ? best.length - 2 : best.length - 1;
+
+      for (int i = iStart; i < best.length - 2; i++) {
+        if (i > kEnd) break;
+        for (int k = i + 1; k <= kEnd; k++) {
+          final trial = List<int>.from(best);
+          final reversed = trial.sublist(i, k + 1).reversed.toList();
+          trial.replaceRange(i, k + 1, reversed);
+          if (cost(trial) + 0.001 < currentCost) {
+            best
+              ..clear()
+              ..addAll(trial);
+            improved = true;
+            break;
+          }
+        }
+        if (improved) break;
+      }
+    }
+    return best;
+  }
+
+  double _polylineDistanceMeters(List<LatLng> line) {
+    if (line.length < 2) return 0;
+    double meters = 0;
+    for (int i = 1; i < line.length; i++) {
+      meters += _distance(line[i - 1], line[i]).toDouble();
+    }
+    return meters;
+  }
+
+  void _startTripTracking(
+    List<LatLng> orderedCheckpoints,
+    double? routeDistanceMeters,
+  ) {
+    _activeTripStartTime = DateTime.now();
+    _activeTripCheckpoints = List<LatLng>.from(orderedCheckpoints);
+    _activeTripDistanceMeters = routeDistanceMeters;
+  }
+
+  Future<void> _finishTripTracking() async {
+    final start = _activeTripStartTime;
+    if (start == null || _activeTripCheckpoints.isEmpty) return;
+
+    final end = DateTime.now();
+    final duration = end.difference(start).inSeconds;
+    final entry = _TripHistoryEntry(
+      startTime: start,
+      endTime: end,
+      checkpoints: List<LatLng>.from(_activeTripCheckpoints),
+      durationSeconds: duration < 0 ? 0 : duration,
+      distanceMeters: _activeTripDistanceMeters,
+    );
+
+    setState(() {
+      _tripHistory.insert(0, entry);
+    });
+    await _persistTripHistory();
+    _resetActiveTripTracking();
+  }
+
+  void _resetActiveTripTracking() {
+    _activeTripStartTime = null;
+    _activeTripCheckpoints = [];
+    _activeTripDistanceMeters = null;
   }
 
   // ---------------------------
@@ -603,7 +888,9 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     }
 
     // si hay ruta activa usamos _navQueue, si no, usamos _checkpoints
-    final next = _navQueue.isNotEmpty ? _navQueue.first : (_checkpoints.isNotEmpty ? _checkpoints.first : null);
+    final next = _navQueue.isNotEmpty
+        ? _navQueue.first
+        : (_checkpoints.isNotEmpty ? _checkpoints.first : null);
     if (next == null) {
       setState(() {
         _metersToNext = null;
@@ -669,7 +956,8 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     if (remaining.isEmpty) return;
 
     final now = DateTime.now();
-    if (now.difference(_lastReroute).inSeconds < _minSecondsBetweenReroutes) return;
+    if (now.difference(_lastReroute).inSeconds < _minSecondsBetweenReroutes)
+      return;
 
     final distToLine = _minDistanceToPolylineMeters(here, _routeLine);
 
@@ -695,11 +983,31 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     return '${(meters / 1000).toStringAsFixed(2)} km';
   }
 
-  void _exitNavMode() {
+  void _cancelTrip() {
     setState(() {
       _navMode = false;
+      _trackingRoute = false;
+      _routeLine = [];
+      _offRoute = false;
       _showArrivePrompt = false;
+      _arrivePromptSnoozeUntil = DateTime.fromMillisecondsSinceEpoch(0);
     });
+    _resetActiveTripTracking();
+    _updateDistanceToNext();
+  }
+
+  void _exitNavMode() {
+    _cancelTrip();
+  }
+
+  Future<void> _openTripHistory() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => _TripHistoryScreen(
+          entries: List<_TripHistoryEntry>.from(_tripHistory),
+        ),
+      ),
+    );
   }
 
   LatLng? _nextCheckpointForUi() {
@@ -742,7 +1050,10 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
             children: [
               Text(
                 _arrivePromptText(),
-                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+                style: const TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.w700,
+                ),
               ),
               const SizedBox(height: 8),
               Row(
@@ -798,7 +1109,7 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
                         blurRadius: 12,
                         offset: const Offset(0, 6),
                         color: Colors.black.withOpacity(0.06),
-                      )
+                      ),
                     ],
                   ),
                   child: const Row(
@@ -830,7 +1141,10 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
                 children: [
                   Expanded(
                     child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 10,
+                      ),
                       decoration: BoxDecoration(
                         color: Colors.white.withOpacity(0.95),
                         borderRadius: BorderRadius.circular(16),
@@ -839,7 +1153,7 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
                             blurRadius: 12,
                             offset: const Offset(0, 6),
                             color: Colors.black.withOpacity(0.06),
-                          )
+                          ),
                         ],
                       ),
                       child: Row(
@@ -851,7 +1165,9 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
                               'Próximo: $distText${_offRoute ? "  •  fuera de ruta" : ""}',
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(fontWeight: FontWeight.w600),
+                              style: const TextStyle(
+                                fontWeight: FontWeight.w600,
+                              ),
                             ),
                           ),
                           if (_buildingRoute)
@@ -886,7 +1202,7 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
               blurRadius: 12,
               offset: const Offset(0, 6),
               color: Colors.black.withOpacity(0.06),
-            )
+            ),
           ],
         ),
         child: Row(
@@ -952,7 +1268,7 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
                       blurRadius: 12,
                       offset: const Offset(0, 6),
                       color: Colors.black.withOpacity(0.06),
-                    )
+                    ),
                   ],
                 ),
                 child: Wrap(
@@ -972,29 +1288,24 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
                   ],
                 ),
               ),
-            if (!_navMode && _checkpoints.isNotEmpty) const SizedBox(height: 10),
+            if (!_navMode && _checkpoints.isNotEmpty)
+              const SizedBox(height: 10),
             if (!_navMode)
               Row(
                 children: [
                   Expanded(
                     child: FilledButton.icon(
-                      onPressed: _pickStartCheckpoint,
-                      icon: const Icon(Icons.flag_circle_outlined),
-                      label: const Text('Inicio'),
+                      onPressed: _openRouteConfigSheet,
+                      icon: const Icon(Icons.route),
+                      label: const Text('Configurar Ruta'),
                     ),
                   ),
                   const SizedBox(width: 8),
                   Expanded(
                     child: FilledButton.icon(
-                      onPressed: _pickEndCheckpoint,
-                      icon: const Icon(Icons.outlined_flag),
-                      label: const Text('Final'),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: FilledButton.icon(
-                      onPressed: _buildingRoute ? null : _buildRoute,
+                      onPressed: (_buildingRoute || _checkpoints.length < 2)
+                          ? null
+                          : _buildRoute,
                       icon: _buildingRoute
                           ? const SizedBox(
                               width: 14,
@@ -1008,33 +1319,66 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
                 ],
               ),
             if (!_navMode) const SizedBox(height: 8),
-            Row(
-              children: [
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: _centerOnMe,
-                    icon: const Icon(Icons.my_location),
-                    label: const Text('Centrar'),
-                  ),
-                ),
-                if (_navMode) ...[
-                  const SizedBox(width: 8),
+            if (!_navMode)
+              Row(
+                children: [
                   Expanded(
-                    child: FilledButton.icon(
-                      onPressed: _buildingRoute ? null : _buildRoute,
-                      icon: _buildingRoute
-                          ? const SizedBox(
-                              width: 14,
-                              height: 14,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.refresh),
-                      label: const Text('Recalcular'),
+                    child: OutlinedButton.icon(
+                      onPressed: _centerOnMe,
+                      icon: const Icon(Icons.my_location),
+                      label: const Text('Centrar'),
                     ),
                   ),
                 ],
-              ],
-            ),
+              ),
+            if (_navMode)
+              Row(
+                children: [
+                  Expanded(
+                    child: SizedBox(
+                      height: 64,
+                      child: OutlinedButton.icon(
+                        onPressed: _centerOnMe,
+                        icon: const Icon(Icons.my_location, size: 26),
+                        label: const Text('Centrar'),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: SizedBox(
+                      height: 64,
+                      child: FilledButton.icon(
+                        onPressed: _buildingRoute ? null : _buildRoute,
+                        icon: _buildingRoute
+                            ? const SizedBox(
+                                width: 18,
+                                height: 18,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : const Icon(Icons.refresh, size: 26),
+                        label: const Text('Recalcular'),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: SizedBox(
+                      height: 64,
+                      child: FilledButton.icon(
+                        onPressed: _cancelTrip,
+                        style: FilledButton.styleFrom(
+                          backgroundColor: Colors.red.shade600,
+                        ),
+                        icon: const Icon(Icons.stop_circle_outlined, size: 26),
+                        label: const Text('Cancelar viaje'),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
           ],
         ),
       ),
@@ -1043,11 +1387,14 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final distText = _metersToNext == null ? null : _formatMeters(_metersToNext!);
+    final distText = _metersToNext == null
+        ? null
+        : _formatMeters(_metersToNext!);
 
     return Scaffold(
       drawer: _AppDrawer(
         onSavedLocations: _openSavedLocations,
+        onTripHistory: _openTripHistory,
       ),
       body: SafeArea(
         child: Stack(
@@ -1058,11 +1405,12 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
                 options: MapOptions(
                   initialCenter: _center,
                   initialZoom: _zoom,
-                  onTap: (_, latLng) => _addCheckpoint(latLng),
+                  onTap: (_, latLng) => _handleMapTap(latLng),
                 ),
                 children: [
                   TileLayer(
-                    urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                    urlTemplate:
+                        'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
                     userAgentPackageName: 'com.example.como_llego',
                   ),
                   CurrentLocationLayer(
@@ -1070,7 +1418,11 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
                     alignDirectionOnUpdate: AlignOnUpdate.never,
                     style: const LocationMarkerStyle(
                       marker: DefaultLocationMarker(
-                        child: Icon(Icons.navigation, color: Colors.white, size: 14),
+                        child: Icon(
+                          Icons.navigation,
+                          color: Colors.white,
+                          size: 14,
+                        ),
                       ),
                       markerSize: Size(34, 34),
                       accuracyCircleColor: Color(0x334E9BFF),
@@ -1080,9 +1432,7 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
                   ),
                   if (_routeLine.isNotEmpty)
                     PolylineLayer(
-                      polylines: [
-                        Polyline(points: _routeLine, strokeWidth: 5),
-                      ],
+                      polylines: [Polyline(points: _routeLine, strokeWidth: 5)],
                     ),
                   MarkerLayer(
                     markers: [
@@ -1102,7 +1452,8 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
             if (!_navMode) ..._buildNormalTopUi(distText),
             if (_navMode) _buildNavTopUi(distText),
             _buildBottomUi(),
-            if (_showArrivePrompt && _navMode && _nextCheckpointForUi() != null) _buildArrivePromptOverlay(),
+            if (_showArrivePrompt && _navMode && _nextCheckpointForUi() != null)
+              _buildArrivePromptOverlay(),
           ],
         ),
       ),
@@ -1116,8 +1467,9 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
 
 class _SearchSheet extends StatefulWidget {
   final Future<List<_SearchResult>> Function(String query) onSearch;
+  final List<_SavedLocation> favorites;
 
-  const _SearchSheet({required this.onSearch});
+  const _SearchSheet({required this.onSearch, this.favorites = const []});
 
   @override
   State<_SearchSheet> createState() => _SearchSheetState();
@@ -1128,6 +1480,19 @@ class _SearchSheetState extends State<_SearchSheet> {
   Timer? _debounce;
   bool _loading = false;
   List<_SearchResult> _results = [];
+
+  List<_SavedLocation> get _orderedFavorites {
+    final query = _controller.text.trim().toLowerCase();
+    final favs = List<_SavedLocation>.from(widget.favorites);
+    if (query.isEmpty) return favs;
+    favs.sort((a, b) {
+      final am = a.name.toLowerCase().contains(query) ? 0 : 1;
+      final bm = b.name.toLowerCase().contains(query) ? 0 : 1;
+      if (am != bm) return am - bm;
+      return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+    });
+    return favs;
+  }
 
   @override
   void dispose() {
@@ -1141,7 +1506,12 @@ class _SearchSheetState extends State<_SearchSheet> {
     _debounce = Timer(const Duration(milliseconds: 350), () async {
       final q = v.trim();
       if (q.length < 3) {
-        if (mounted) setState(() => _results = []);
+        if (mounted) {
+          setState(() {
+            _results = [];
+            _loading = false;
+          });
+        }
         return;
       }
 
@@ -1172,7 +1542,7 @@ class _SearchSheetState extends State<_SearchSheet> {
                 autofocus: true,
                 onChanged: _onChanged,
                 decoration: InputDecoration(
-                  hintText: 'Buscar dirección (Mendoza)…',
+                  hintText: 'Buscar direccion (Mendoza)...',
                   prefixIcon: const Icon(Icons.search),
                   suffixIcon: _controller.text.isEmpty
                       ? null
@@ -1180,39 +1550,120 @@ class _SearchSheetState extends State<_SearchSheet> {
                           icon: const Icon(Icons.clear),
                           onPressed: () {
                             _controller.clear();
-                            setState(() => _results = []);
+                            setState(() {
+                              _results = [];
+                              _loading = false;
+                            });
                           },
                         ),
-                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
                 ),
               ),
             ),
             if (_loading) const LinearProgressIndicator(minHeight: 2),
-            Expanded(
-              child: _results.isEmpty
-                  ? const Center(
-                      child: Text('Escribí al menos 3 letras para ver sugerencias.'),
-                    )
-                  : ListView.separated(
-                      itemCount: _results.length,
-                      separatorBuilder: (_, __) => const Divider(height: 1),
-                      itemBuilder: (_, i) {
-                        final r = _results[i];
-                        return ListTile(
-                          title: Text(r.title),
-                          subtitle: Text(r.subtitle),
-                          onTap: () => Navigator.pop(context, r),
-                        );
-                      },
-                    ),
-            ),
+            Expanded(child: _buildResultsList()),
           ],
         ),
       ),
     );
   }
-}
 
+  Widget _buildResultsList() {
+    final favorites = _orderedFavorites;
+    final hasFavorites = favorites.isNotEmpty;
+    final showHint =
+        _results.isEmpty && _controller.text.trim().length < 3 && !hasFavorites;
+
+    if (showHint) {
+      return const Center(
+        child: Text('Escribi al menos 3 letras para ver sugerencias.'),
+      );
+    }
+
+    final items = <Widget>[];
+    if (hasFavorites) {
+      items.add(
+        const Padding(
+          padding: EdgeInsets.fromLTRB(16, 8, 16, 6),
+          child: Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              'Favoritos',
+              style: TextStyle(fontWeight: FontWeight.w700),
+            ),
+          ),
+        ),
+      );
+      for (final fav in favorites) {
+        final title = fav.name;
+        final subtitle =
+            '${fav.point.latitude.toStringAsFixed(5)}, ${fav.point.longitude.toStringAsFixed(5)}';
+        items.add(
+          ListTile(
+            leading: const Icon(Icons.bookmark_outline),
+            title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
+            subtitle: Text(
+              subtitle,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+            onTap: () => Navigator.pop(
+              context,
+              _SearchResult(
+                title: title,
+                subtitle: 'Favorito',
+                point: fav.point,
+              ),
+            ),
+          ),
+        );
+      }
+      items.add(const Divider(height: 1));
+    }
+
+    if (_results.isEmpty) {
+      items.add(
+        const Padding(
+          padding: EdgeInsets.all(20),
+          child: Center(
+            child: Text('Sin resultados de busqueda para este texto.'),
+          ),
+        ),
+      );
+    } else {
+      items.add(
+        const Padding(
+          padding: EdgeInsets.fromLTRB(16, 10, 16, 6),
+          child: Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              'Resultados',
+              style: TextStyle(fontWeight: FontWeight.w700),
+            ),
+          ),
+        ),
+      );
+      for (final r in _results) {
+        items.add(
+          ListTile(
+            leading: const Icon(Icons.place_outlined),
+            title: Text(r.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+            subtitle: Text(
+              r.subtitle,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+            onTap: () => Navigator.pop(context, r),
+          ),
+        );
+      }
+    }
+
+    return ListView(children: items);
+  }
+}
 // ---------------------------
 // Saved Locations Screen (Drawer)
 // ---------------------------
@@ -1221,10 +1672,7 @@ class _SavedLocationsScreen extends StatefulWidget {
   final List<_SavedLocation> initial;
   final Future<List<_SearchResult>> Function(String query) onSearch;
 
-  const _SavedLocationsScreen({
-    required this.initial,
-    required this.onSearch,
-  });
+  const _SavedLocationsScreen({required this.initial, required this.onSearch});
 
   @override
   State<_SavedLocationsScreen> createState() => _SavedLocationsScreenState();
@@ -1244,7 +1692,8 @@ class _SavedLocationsScreenState extends State<_SavedLocationsScreen> {
       context: context,
       isScrollControlled: true,
       showDragHandle: true,
-      builder: (_) => _SearchSheet(onSearch: widget.onSearch),
+      builder: (_) =>
+          _SearchSheet(onSearch: widget.onSearch, favorites: _items),
     );
     if (picked == null) return;
 
@@ -1257,10 +1706,15 @@ class _SavedLocationsScreenState extends State<_SavedLocationsScreen> {
           content: TextField(
             controller: c,
             autofocus: true,
-            decoration: const InputDecoration(hintText: 'Nombre (ej: Casa, Trabajo, Terminal)'),
+            decoration: const InputDecoration(
+              hintText: 'Nombre (ej: Casa, Trabajo, Terminal)',
+            ),
           ),
           actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancelar')),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Cancelar'),
+            ),
             FilledButton(
               onPressed: () => Navigator.pop(ctx, c.text.trim()),
               child: const Text('Guardar'),
@@ -1314,7 +1768,9 @@ class _SavedLocationsScreenState extends State<_SavedLocationsScreen> {
       ),
       body: _items.isEmpty
           ? const Center(
-              child: Text('No tenés ubicaciones guardadas.\nTocá + para agregar una.'),
+              child: Text(
+                'No tenés ubicaciones guardadas.\nTocá + para agregar una.',
+              ),
             )
           : ListView.separated(
               padding: const EdgeInsets.all(16),
@@ -1330,7 +1786,10 @@ class _SavedLocationsScreenState extends State<_SavedLocationsScreen> {
                     borderRadius: BorderRadius.circular(18),
                     onTap: () => _select(it),
                     child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 14,
+                      ),
                       child: Row(
                         children: [
                           const Icon(Icons.place_outlined),
@@ -1340,7 +1799,9 @@ class _SavedLocationsScreenState extends State<_SavedLocationsScreen> {
                               it.name,
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(fontWeight: FontWeight.w600),
+                              style: const TextStyle(
+                                fontWeight: FontWeight.w600,
+                              ),
                             ),
                           ),
                           IconButton(
@@ -1365,58 +1826,144 @@ class _SavedLocationsScreenState extends State<_SavedLocationsScreen> {
 }
 
 // ---------------------------
-// Sheet para elegir checkpoint (inicio / fin)
+// Sheet para configurar inicio / fin
 // ---------------------------
 
-class _PickCheckpointSheet extends StatelessWidget {
-  final String title;
-  final int count;
-  final int? selected;
-  final bool allowNone;
-  final String noneLabel;
+class _RouteConfigResult {
+  final int? startCheckpointNumber;
+  final int? endCheckpointNumber;
 
-  const _PickCheckpointSheet({
-    required this.title,
+  const _RouteConfigResult({
+    required this.startCheckpointNumber,
+    required this.endCheckpointNumber,
+  });
+}
+
+class _RouteConfigSheet extends StatefulWidget {
+  final int count;
+  final int? initialStart;
+  final int? initialEnd;
+
+  const _RouteConfigSheet({
     required this.count,
+    required this.initialStart,
+    required this.initialEnd,
+  });
+
+  @override
+  State<_RouteConfigSheet> createState() => _RouteConfigSheetState();
+}
+
+class _RouteConfigSheetState extends State<_RouteConfigSheet> {
+  int? _selectedStart;
+  int? _selectedEnd;
+
+  @override
+  void initState() {
+    super.initState();
+    _selectedStart = widget.initialStart;
+    _selectedEnd = widget.initialEnd;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 18),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                'Inicio',
+                style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16),
+              ),
+            ),
+            _RouteChoiceTile(
+              selected: _selectedStart == null,
+              label: 'Mi ubicacion (default)',
+              onTap: () => setState(() => _selectedStart = null),
+            ),
+            SizedBox(
+              height: 120,
+              child: ListView.builder(
+                itemCount: widget.count,
+                itemBuilder: (_, i) => _RouteChoiceTile(
+                  selected: _selectedStart == i + 1,
+                  label: 'Checkpoint ${i + 1}',
+                  onTap: () => setState(() => _selectedStart = i + 1),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            const Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                'Final',
+                style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16),
+              ),
+            ),
+            _RouteChoiceTile(
+              selected: _selectedEnd == null,
+              label: 'Ultimo checkpoint (default)',
+              onTap: () => setState(() => _selectedEnd = null),
+            ),
+            SizedBox(
+              height: 120,
+              child: ListView.builder(
+                itemCount: widget.count,
+                itemBuilder: (_, i) => _RouteChoiceTile(
+                  selected: _selectedEnd == i + 1,
+                  label: 'Checkpoint ${i + 1}',
+                  onTap: () => setState(() => _selectedEnd = i + 1),
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton(
+                onPressed: () {
+                  Navigator.pop(
+                    context,
+                    _RouteConfigResult(
+                      startCheckpointNumber: _selectedStart,
+                      endCheckpointNumber: _selectedEnd,
+                    ),
+                  );
+                },
+                child: const Text('Aplicar'),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _RouteChoiceTile extends StatelessWidget {
+  final bool selected;
+  final String label;
+  final VoidCallback onTap;
+
+  const _RouteChoiceTile({
     required this.selected,
-    required this.allowNone,
-    required this.noneLabel,
+    required this.label,
+    required this.onTap,
   });
 
   @override
   Widget build(BuildContext context) {
-    final items = <Widget>[];
-
-    items.add(
-      ListTile(
-        title: Text(title, style: const TextStyle(fontWeight: FontWeight.w700)),
-        subtitle: const Text('Elegí un checkpoint'),
+    return ListTile(
+      dense: true,
+      contentPadding: EdgeInsets.zero,
+      leading: Icon(
+        selected ? Icons.radio_button_checked : Icons.radio_button_unchecked,
       ),
-    );
-
-    if (allowNone) {
-      items.add(
-        ListTile(
-          leading: Icon(selected == null ? Icons.check_circle : Icons.radio_button_unchecked),
-          title: Text(noneLabel),
-          onTap: () => Navigator.pop(context, 0), // 0 = none
-        ),
-      );
-    }
-
-    for (int i = 1; i <= count; i++) {
-      final isSel = selected == i;
-      items.add(
-        ListTile(
-          leading: Icon(isSel ? Icons.check_circle : Icons.radio_button_unchecked),
-          title: Text('Checkpoint $i'),
-          onTap: () => Navigator.pop(context, i),
-        ),
-      );
-    }
-
-    return SafeArea(
-      child: ListView(children: items),
+      title: Text(label),
+      onTap: onTap,
     );
   }
 }
@@ -1439,11 +1986,7 @@ class _IconPill extends StatelessWidget {
       child: InkWell(
         borderRadius: BorderRadius.circular(16),
         onTap: onTap,
-        child: SizedBox(
-          height: 46,
-          width: 46,
-          child: Icon(icon),
-        ),
+        child: SizedBox(height: 46, width: 46, child: Icon(icon)),
       ),
     );
   }
@@ -1464,13 +2007,16 @@ class _CheckpointMarker extends StatelessWidget {
             blurRadius: 10,
             offset: const Offset(0, 6),
             color: Colors.black.withOpacity(0.15),
-          )
+          ),
         ],
       ),
       alignment: Alignment.center,
       child: Text(
         '$index',
-        style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w700),
+        style: const TextStyle(
+          color: Colors.white,
+          fontWeight: FontWeight.w700,
+        ),
       ),
     );
   }
@@ -1480,7 +2026,11 @@ class _SearchResult {
   final String title;
   final String subtitle;
   final LatLng point;
-  _SearchResult({required this.title, required this.subtitle, required this.point});
+  _SearchResult({
+    required this.title,
+    required this.subtitle,
+    required this.point,
+  });
 }
 
 class _SavedLocation {
@@ -1490,10 +2040,10 @@ class _SavedLocation {
   _SavedLocation({required this.name, required this.point});
 
   Map<String, dynamic> toJson() => {
-        'name': name,
-        'lat': point.latitude,
-        'lon': point.longitude,
-      };
+    'name': name,
+    'lat': point.latitude,
+    'lon': point.longitude,
+  };
 
   factory _SavedLocation.fromJson(Map<String, dynamic> json) {
     return _SavedLocation(
@@ -1506,6 +2056,50 @@ class _SavedLocation {
   }
 }
 
+class _TripHistoryEntry {
+  final DateTime startTime;
+  final DateTime endTime;
+  final List<LatLng> checkpoints;
+  final int durationSeconds;
+  final double? distanceMeters;
+
+  const _TripHistoryEntry({
+    required this.startTime,
+    required this.endTime,
+    required this.checkpoints,
+    required this.durationSeconds,
+    this.distanceMeters,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'startTime': startTime.toIso8601String(),
+    'endTime': endTime.toIso8601String(),
+    'durationSeconds': durationSeconds,
+    'distanceMeters': distanceMeters,
+    'checkpoints': checkpoints
+        .map((p) => {'lat': p.latitude, 'lon': p.longitude})
+        .toList(),
+  };
+
+  factory _TripHistoryEntry.fromJson(Map<String, dynamic> json) {
+    final cps = (json['checkpoints'] as List<dynamic>? ?? const [])
+        .map(
+          (e) => LatLng(
+            (e['lat'] as num).toDouble(),
+            (e['lon'] as num).toDouble(),
+          ),
+        )
+        .toList();
+    return _TripHistoryEntry(
+      startTime: DateTime.parse((json['startTime'] ?? '').toString()),
+      endTime: DateTime.parse((json['endTime'] ?? '').toString()),
+      checkpoints: cps,
+      durationSeconds: (json['durationSeconds'] as num?)?.toInt() ?? 0,
+      distanceMeters: (json['distanceMeters'] as num?)?.toDouble(),
+    );
+  }
+}
+
 class _SavedLocationsResult {
   final List<_SavedLocation> updatedList;
   final _SavedLocation? selected;
@@ -1514,8 +2108,12 @@ class _SavedLocationsResult {
 
 class _AppDrawer extends StatelessWidget {
   final VoidCallback onSavedLocations;
+  final VoidCallback onTripHistory;
 
-  const _AppDrawer({required this.onSavedLocations});
+  const _AppDrawer({
+    required this.onSavedLocations,
+    required this.onTripHistory,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -1525,16 +2123,20 @@ class _AppDrawer extends StatelessWidget {
           children: [
             const ListTile(title: Text('Menú')),
             const Divider(),
-            const ListTile(leading: Icon(Icons.person_outline), title: Text('Perfil')),
-            const ListTile(leading: Icon(Icons.place_outlined), title: Text('Ubicaciones')),
-            const ListTile(leading: Icon(Icons.history), title: Text('Viajes anteriores')),
-            const Divider(),
             ListTile(
               leading: const Icon(Icons.bookmark_outline),
               title: const Text('Ubicaciones guardadas'),
               onTap: () {
                 Navigator.pop(context);
                 onSavedLocations();
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.history),
+              title: const Text('Historial de viajes'),
+              onTap: () {
+                Navigator.pop(context);
+                onTripHistory();
               },
             ),
           ],
@@ -1544,4 +2146,56 @@ class _AppDrawer extends StatelessWidget {
   }
 }
 
+class _TripHistoryScreen extends StatelessWidget {
+  final List<_TripHistoryEntry> entries;
 
+  const _TripHistoryScreen({required this.entries});
+
+  String _fmtDate(DateTime dt) {
+    final d = dt.toLocal();
+    return '${d.day.toString().padLeft(2, '0')}/${d.month.toString().padLeft(2, '0')}/${d.year} '
+        '${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}';
+  }
+
+  String _fmtDuration(int seconds) {
+    final h = seconds ~/ 3600;
+    final m = (seconds % 3600) ~/ 60;
+    final s = seconds % 60;
+    if (h > 0) return '${h}h ${m}m';
+    if (m > 0) return '${m}m ${s}s';
+    return '${s}s';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final sorted = List<_TripHistoryEntry>.from(entries)
+      ..sort((a, b) => b.startTime.compareTo(a.startTime));
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Historial de viajes')),
+      body: sorted.isEmpty
+          ? const Center(child: Text('Todavia no hay viajes guardados.'))
+          : ListView.separated(
+              padding: const EdgeInsets.all(16),
+              itemCount: sorted.length,
+              separatorBuilder: (_, __) => const SizedBox(height: 10),
+              itemBuilder: (_, i) {
+                final e = sorted[i];
+                final distanceText = e.distanceMeters == null
+                    ? ''
+                    : ' - ${(e.distanceMeters! / 1000).toStringAsFixed(2)} km';
+                return ListTile(
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  tileColor: Colors.white,
+                  title: Text(_fmtDate(e.startTime)),
+                  subtitle: Text(
+                    'Puntos: ${e.checkpoints.length} - Duracion: ${_fmtDuration(e.durationSeconds)}$distanceText',
+                  ),
+                );
+              },
+            ),
+    );
+  }
+}
