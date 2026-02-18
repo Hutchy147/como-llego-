@@ -413,25 +413,25 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
       _sanitizeStartEnd();
     });
 
-    // si quedan, recalcula
-    if (_checkpoints.length >= 2) {
+    // si quedan, recalcula (incluye última pierna con 1 checkpoint)
+    if (_checkpoints.isNotEmpty) {
       await _buildRoute();
       return;
     }
 
-    if (_checkpoints.isEmpty) {
-      await _finishTripTracking();
-      setState(() {
-        _routeLine = [];
-        _trackingRoute = false;
-        _lastTrimBestIdx = 0;
-        _lastOffRouteBestIdx = 0;
-        _setOffRoute(false);
-        _setNavMode(false);
-      });
-    } else {
-      _updateDistanceToNext(force: true);
-    }
+    await _finishTripIfActive(completed: true);
+    setState(() {
+      _routeLine = [];
+      _trackingRoute = false;
+      _lastTrimBestIdx = 0;
+      _lastOffRouteBestIdx = 0;
+      _setOffRoute(false);
+      _setNavMode(false);
+      _setMetersToNext(null, force: true);
+      _setShowArrivePrompt(false);
+      _arrivePromptSnoozeUntil = DateTime.fromMillisecondsSinceEpoch(0);
+    });
+    _snack('Viaje finalizado');
   }
 
   Future<void> _confirmArrived() async {
@@ -570,8 +570,8 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
   Future<void> _buildRoute() async {
     if (_buildingRoute) return;
 
-    if (_checkpoints.length < 2) {
-      _snack('Agregá al menos 2 checkpoints.');
+    if (_checkpoints.isEmpty) {
+      _snack('Agregá al menos 1 checkpoint.');
       return;
     }
 
@@ -590,6 +590,10 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     try {
       final wasTracking = _trackingRoute;
       final ordered = await _buildOrderedWaypointsForRoute(startPos);
+      if (ordered.isEmpty) {
+        _snack('No hay checkpoints para navegar.');
+        return;
+      }
 
       // cola de navegación = el orden elegido (sin mi posición)
       setState(() {
@@ -879,14 +883,25 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     List<LatLng> orderedCheckpoints,
     double? routeDistanceMeters,
   ) {
+    if (_activeTripStartTime != null && _activeTripCheckpoints.isNotEmpty) {
+      return;
+    }
     _activeTripStartTime = DateTime.now();
     _activeTripCheckpoints = List<LatLng>.from(orderedCheckpoints);
     _activeTripDistanceMeters = routeDistanceMeters;
   }
 
-  Future<void> _finishTripTracking() async {
+  Future<void> _finishTripIfActive({required bool completed}) async {
     final start = _activeTripStartTime;
-    if (start == null || _activeTripCheckpoints.isEmpty) return;
+    if (start == null || _activeTripCheckpoints.isEmpty) {
+      _resetActiveTripTracking();
+      return;
+    }
+
+    if (!completed) {
+      _resetActiveTripTracking();
+      return;
+    }
 
     final end = DateTime.now();
     final duration = end.difference(start).inSeconds;
@@ -898,6 +913,7 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
       distanceMeters: _activeTripDistanceMeters,
     );
 
+    if (!mounted) return;
     setState(() {
       _tripHistory.insert(0, entry);
     });
@@ -1085,12 +1101,14 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     if (remaining.isEmpty) return;
 
     final currentNow = now ?? DateTime.now();
-    if (currentNow.difference(_lastOffRouteCheckAt) < _offRouteCheckMinInterval) {
+    if (currentNow.difference(_lastOffRouteCheckAt) <
+        _offRouteCheckMinInterval) {
       return;
     }
     _lastOffRouteCheckAt = currentNow;
 
-    if (currentNow.difference(_lastReroute).inSeconds < _minSecondsBetweenReroutes)
+    if (currentNow.difference(_lastReroute).inSeconds <
+        _minSecondsBetweenReroutes)
       return;
 
     final distToLine = _minDistanceToPolylineMeters(here, _routeLine);
@@ -1122,7 +1140,7 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     return '${(meters / 1000).toStringAsFixed(2)} km';
   }
 
-  void _cancelTrip() {
+  Future<void> _cancelTrip() async {
     setState(() {
       _setNavMode(false);
       _trackingRoute = false;
@@ -1133,12 +1151,12 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
       _setShowArrivePrompt(false);
       _arrivePromptSnoozeUntil = DateTime.fromMillisecondsSinceEpoch(0);
     });
-    _resetActiveTripTracking();
+    await _finishTripIfActive(completed: false);
     _updateDistanceToNext(force: true);
   }
 
-  void _exitNavMode() {
-    _cancelTrip();
+  Future<void> _exitNavMode() async {
+    await _cancelTrip();
   }
 
   Future<void> _openTripHistory() async {
@@ -1444,7 +1462,7 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
                   const SizedBox(width: 8),
                   Expanded(
                     child: FilledButton.icon(
-                      onPressed: (_buildingRoute || _checkpoints.length < 2)
+                      onPressed: (_buildingRoute || _checkpoints.isEmpty)
                           ? null
                           : _buildRoute,
                       icon: _buildingRoute
@@ -1557,7 +1575,9 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
                 ]),
                 builder: (context, _) {
                   final meters = _metersToNextNotifier.value;
-                  final distText = meters == null ? null : _formatMeters(meters);
+                  final distText = meters == null
+                      ? null
+                      : _formatMeters(meters);
                   return Stack(
                     children: [
                       if (!_navMode) ..._buildNormalTopUi(distText),
@@ -1624,7 +1644,9 @@ class _MapCanvas extends StatelessWidget {
           ),
         ),
         if (routeLine.isNotEmpty)
-          PolylineLayer(polylines: [Polyline(points: routeLine, strokeWidth: 5)]),
+          PolylineLayer(
+            polylines: [Polyline(points: routeLine, strokeWidth: 5)],
+          ),
         MarkerLayer(
           markers: [
             for (int i = 0; i < checkpoints.length; i++)
@@ -2379,4 +2401,3 @@ class _TripHistoryScreen extends StatelessWidget {
     );
   }
 }
-
