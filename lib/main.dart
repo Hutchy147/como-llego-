@@ -215,7 +215,9 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
 
     try {
       final p = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.bestForNavigation,
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.bestForNavigation,
+        ),
       );
       _setMyPos(p);
       if (_myPos != null) _mapController.move(_myPos!, 16);
@@ -1108,8 +1110,9 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     _lastOffRouteCheckAt = currentNow;
 
     if (currentNow.difference(_lastReroute).inSeconds <
-        _minSecondsBetweenReroutes)
+        _minSecondsBetweenReroutes) {
       return;
+    }
 
     final distToLine = _minDistanceToPolylineMeters(here, _routeLine);
 
@@ -1897,6 +1900,7 @@ class _SavedLocationsScreenState extends State<_SavedLocationsScreen> {
       builder: (_) =>
           _SearchSheet(onSearch: widget.onSearch, favorites: _items),
     );
+    if (!mounted) return;
     if (picked == null) return;
 
     final name = await showDialog<String>(
@@ -1977,7 +1981,8 @@ class _SavedLocationsScreenState extends State<_SavedLocationsScreen> {
           : ListView.separated(
               padding: const EdgeInsets.all(16),
               itemCount: _items.length,
-              separatorBuilder: (_, __) => const SizedBox(height: 12),
+              separatorBuilder: (BuildContext context, int index) =>
+                  const SizedBox(height: 12),
               itemBuilder: (context, i) {
                 final it = _items[i];
                 return Material(
@@ -2380,8 +2385,9 @@ class _TripHistoryScreen extends StatelessWidget {
           : ListView.separated(
               padding: const EdgeInsets.all(16),
               itemCount: sorted.length,
-              separatorBuilder: (_, __) => const SizedBox(height: 10),
-              itemBuilder: (_, i) {
+              separatorBuilder: (BuildContext context, int index) =>
+                  const SizedBox(height: 10),
+              itemBuilder: (BuildContext context, int i) {
                 final e = sorted[i];
                 final distanceText = e.distanceMeters == null
                     ? ''
