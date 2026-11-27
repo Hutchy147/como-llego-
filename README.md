@@ -19,8 +19,8 @@ sin costo.
 
 ## Qué hace
 
-- **Paradas en el mapa:** tocás para agregar un punto y lo volvés a tocar para
-  sacarlo. También podés buscar una dirección.
+- **Paradas en el mapa:** tocás el mapa para agregar un punto, o buscás una
+  dirección. Desde «Configurar ruta» elegís el inicio y el final.
 - **Orden óptimo de visita:** pide a OSRM la matriz de tiempos de manejo entre
   todos los puntos y resuelve el recorrido (ver abajo). Podés fijar cuál es la
   primera parada y cuál la última.
