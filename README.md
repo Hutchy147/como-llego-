@@ -1,4 +1,4 @@
-# ¿Cómo llego?
+<p align="center"><img src="docs/banner.svg" alt="¿Cómo llego?: app de reparto con varias paradas" width="100%"></p>
 
 App de **reparto y recorridos con varias paradas** para Android, hecha en
 **Flutter**. Marcás los puntos en el mapa (o los buscás por dirección), la app
@@ -17,7 +17,7 @@ sin costo.
 |---|---|---|
 | ![Mapa](docs/marker.jpeg) | ![Ruta](docs/ruta.jpeg) | ![Menú](docs/menu.jpeg) |
 
-## Qué hace
+## 📍 Qué hace
 
 - **Paradas en el mapa:** tocás el mapa para agregar un punto, o buscás una
   dirección. Desde «Configurar ruta» elegís el inicio y el final.
@@ -31,7 +31,7 @@ sin costo.
 - **Ubicaciones guardadas** e **historial de viajes**, persistidos en el
   teléfono.
 
-## Cómo optimiza el recorrido
+## 🧭 Cómo optimiza el recorrido
 
 Es un caso del problema del viajante (TSP) con extremos fijos:
 
@@ -47,7 +47,7 @@ Es un caso del problema del viajante (TSP) con extremos fijos:
 Para la cantidad de paradas de un reparto (de 5 a 30), esto da recorridos
 muy cerca del óptimo en milisegundos y en el propio teléfono.
 
-## Correrlo
+## 🚚 Correrlo
 
 Requiere el [SDK de Flutter](https://docs.flutter.dev/get-started/install) y
 un dispositivo o emulador Android con GPS.
